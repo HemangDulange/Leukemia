@@ -44,8 +44,8 @@ def build_backbone(
     img_size:
         Input spatial resolution. Integer or (height, width).
     stream_prefix:
-        Prefix prepended to each layer name to guarantee unique layer names
-        when multiple backbones exist in a dual-stream model.
+        Prefix prepended to the wrapper model name to guarantee unique
+        operation names when multiple backbones exist in a dual-stream model.
     weights:
         Pretrained weights to load (default: 'imagenet', or None).
     unfreeze_top_n:
@@ -70,31 +70,26 @@ def build_backbone(
     backbone_fn = _BACKBONE_REGISTRY[name]
     model_name = f"{stream_prefix}_backbone" if stream_prefix else f"{name.lower()}_backbone"
 
-    # Instantiate base model with ImageNet weights, no classification top, and global average pooling
-    try:
-        base_model = backbone_fn(
-            include_top=False,
-            weights=weights,
-            input_shape=input_shape,
-            pooling="avg",
-            name=model_name,
-        )
-    except TypeError:
-        base_model = backbone_fn(
-            include_top=False,
-            weights=weights,
-            input_shape=input_shape,
-            pooling="avg",
-        )
-        base_model._name = model_name
+    # Instantiate base model with its DEFAULT name so that Keras resolves the
+    # correct ImageNet weights URL (e.g. "efficientnetb0_notop.h5").
+    base_model = backbone_fn(
+        include_top=False,
+        weights=weights,
+        input_shape=input_shape,
+        pooling="avg",
+    )
 
-    # Prefix all layer names to ensure 100% uniqueness across streams
-    if stream_prefix:
-        for layer in base_model.layers:
-            layer._name = f"{stream_prefix}_{layer.name}"
-
-    # Configure freezing / unfreezing of top N layers
+    # Configure freezing / unfreezing on the inner base_model layers
     set_trainable_layers(base_model, unfreeze_top_n=unfreeze_top_n)
+
+    # Wrap in a new keras.Model with a unique stream-specific name so that
+    # two backbones can coexist in the same dual-stream functional graph
+    # without Keras complaining about duplicate operation names.
+    wrapped = keras.Model(
+        inputs=base_model.input,
+        outputs=base_model.output,
+        name=model_name,
+    )
 
     logger.info(
         "Built backbone: %s | input_shape=%s | unfreeze_top_n=%d | total_layers=%d | trainable_weights=%d",
@@ -102,10 +97,10 @@ def build_backbone(
         input_shape,
         unfreeze_top_n,
         len(base_model.layers),
-        len(base_model.trainable_weights),
+        len(wrapped.trainable_weights),
     )
 
-    return base_model
+    return wrapped
 
 
 def set_trainable_layers(
