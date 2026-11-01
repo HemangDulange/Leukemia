@@ -117,6 +117,8 @@ class PathsConfig:
     reports_dir: Path
     figures_dir: Path
     metrics_dir: Path
+    hf_repo_id: str = "HemangDulange/leukemia-all-classifier"
+    hf_filename: str = "dual_stream.keras"
 
     @property
     def model_path(self) -> Path:
@@ -243,6 +245,8 @@ def load_config(config_path: Path | str | None = None) -> AppConfig:
         reports_dir=root / p_raw["reports_dir"],
         figures_dir=root / p_raw["figures_dir"],
         metrics_dir=root / p_raw["metrics_dir"],
+        hf_repo_id=p_raw.get("hf_repo_id", "HemangDulange/leukemia-all-classifier"),
+        hf_filename=p_raw.get("hf_filename", "dual_stream.keras"),
     )
 
     cfg = AppConfig(

@@ -51,16 +51,9 @@ class Predictor:
         self._model = self._load_model()
 
     def _load_model(self) -> tf.keras.Model:
-        """Load and cache the trained Keras model."""
-        if not self._model_path.exists():
-            raise FileNotFoundError(
-                f"Saved model not found at: {self._model_path}\n"
-                "Train the model first using `python scripts/train.py`."
-            )
-        logger.info("Loading dual-stream model from %s...", self._model_path)
-        model = tf.keras.models.load_model(str(self._model_path))
-        logger.info("Model loaded successfully (%d layers).", len(model.layers))
-        return model
+        """Load and cache the trained Keras model using local weights or Hugging Face Hub."""
+        from src.inference.model_loader import load_trained_model
+        return load_trained_model(cfg=self._cfg, custom_path=self._model_path)
 
     def _load_class_names(self) -> Dict[str, Any]:
         """Load canonical class mappings from models/class_names.json."""

@@ -86,3 +86,6 @@ paths:
   reports_dir: reports
   figures_dir: reports/figures
   metrics_dir: reports/metrics
+  # Hugging Face Hub model download fallback (exceeds GitHub 100MB limit)
+  hf_repo_id: "HemangDulange/leukemia-all-classifier"
+  hf_filename: "dual_stream.keras"

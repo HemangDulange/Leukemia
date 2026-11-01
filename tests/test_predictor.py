@@ -49,11 +49,11 @@ def temporary_smoke_model(cfg, tmp_path_factory) -> Path:
 
 class TestPredictor:
     def test_predictor_raises_if_model_missing(self, cfg, tmp_path):
-        """Predictor must raise FileNotFoundError if target model path does not exist."""
+        """Predictor must raise error if target model path does not exist and cannot be fetched."""
         from src.inference.predictor import Predictor
 
         missing_path = tmp_path / "non_existent_model.keras"
-        with pytest.raises(FileNotFoundError, match="Saved model not found"):
+        with pytest.raises((FileNotFoundError, RuntimeError)):
             Predictor(cfg, model_path=missing_path)
 
     def test_predict_with_sample_image(self, cfg, temporary_smoke_model, sample_blood_smear_image):
