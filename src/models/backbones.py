@@ -68,14 +68,25 @@ def build_backbone(
         input_shape = (img_size[0], img_size[1], 3)
 
     backbone_fn = _BACKBONE_REGISTRY[name]
+    model_name = f"{stream_prefix}_backbone" if stream_prefix else f"{name.lower()}_backbone"
 
     # Instantiate base model with ImageNet weights, no classification top, and global average pooling
-    base_model = backbone_fn(
-        include_top=False,
-        weights=weights,
-        input_shape=input_shape,
-        pooling="avg",
-    )
+    try:
+        base_model = backbone_fn(
+            include_top=False,
+            weights=weights,
+            input_shape=input_shape,
+            pooling="avg",
+            name=model_name,
+        )
+    except TypeError:
+        base_model = backbone_fn(
+            include_top=False,
+            weights=weights,
+            input_shape=input_shape,
+            pooling="avg",
+        )
+        base_model._name = model_name
 
     # Prefix all layer names to ensure 100% uniqueness across streams
     if stream_prefix:
@@ -84,9 +95,6 @@ def build_backbone(
 
     # Configure freezing / unfreezing of top N layers
     set_trainable_layers(base_model, unfreeze_top_n=unfreeze_top_n)
-
-    model_name = f"{stream_prefix}_backbone" if stream_prefix else f"{name}_backbone"
-    base_model._name = model_name
 
     logger.info(
         "Built backbone: %s | input_shape=%s | unfreeze_top_n=%d | total_layers=%d | trainable_weights=%d",
