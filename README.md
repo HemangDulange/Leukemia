@@ -244,19 +244,3 @@ This software is an artificial intelligence research demonstration and is **not*
 
 ---
 
-## 📜 Citation
-
-If you use this work or dataset in your research, please cite the original study:
-
-```bibtex
-@article{ghaderzadeh2022fast,
-  title={A fast and efficient CNN model for B-ALL diagnosis and its subtypes classification using peripheral blood smear images},
-  author={Ghaderzadeh, Mostafa and Aria, Mehrad and Hosseini, Asaad and Asadi, Farhad and Bashash, Davood and Abolghasemi, Hassan},
-  journal={International Journal of Intelligent Systems},
-  volume={37},
-  number={8},
-  pages={5113--5133},
-  year={2022},
-  publisher={Wiley Online Library}
-}
-```
