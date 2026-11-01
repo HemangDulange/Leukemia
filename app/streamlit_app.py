@@ -23,7 +23,10 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 from PIL import Image, UnidentifiedImageError
 import streamlit as st
 
@@ -339,9 +342,17 @@ def render_performance_tab() -> None:
     # Display evaluation CSV summary if available
     eval_csv = metrics_dir / "evaluation.csv"
     if eval_csv.exists():
-        df_metrics = pd.read_csv(eval_csv)
-        st.markdown("#### 📋 Test Set Evaluation Metrics")
-        st.dataframe(df_metrics, use_container_width=True)
+        if pd is not None:
+            df_metrics = pd.read_csv(eval_csv)
+            st.markdown("#### 📋 Test Set Evaluation Metrics")
+            st.dataframe(df_metrics, use_container_width=True)
+        else:
+            import csv
+            with open(eval_csv, mode="r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            st.markdown("#### 📋 Test Set Evaluation Metrics")
+            st.dataframe(rows, use_container_width=True)
 
     st.markdown("---")
     st.markdown("#### 📊 Evaluation Figures (300 DPI)")
