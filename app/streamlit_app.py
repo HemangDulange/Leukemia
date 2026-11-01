@@ -16,10 +16,15 @@ Layout & Features:
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
 import io
 import json
 import logging
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -29,12 +34,6 @@ except ImportError:
     pd = None
 from PIL import Image, UnidentifiedImageError
 import streamlit as st
-
-# ── Ensure repository root is on sys.path ─────────────────────────────────────
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-import sys
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 from src.config import load_config
 from src.inference.predictor import Predictor
