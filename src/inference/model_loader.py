@@ -31,6 +31,28 @@ def configure_low_memory_runtime() -> None:
     except Exception as e:
         logger.debug("Could not adjust thread pool settings: %s", e)
 
+    _patch_keras_deserialization_compat()
+
+
+def _patch_keras_deserialization_compat() -> None:
+    """Ensure backwards compatibility when loading models across Keras 3 minor versions."""
+    try:
+        import keras
+        orig_from_config = keras.layers.Layer.from_config
+        if getattr(orig_from_config, "_compat_patched", False):
+            return
+
+        @classmethod
+        def patched_from_config(cls, config):
+            cfg = dict(config)
+            cfg.pop("quantization_config", None)
+            return orig_from_config.__func__(cls, cfg)
+
+        patched_from_config._compat_patched = True
+        keras.layers.Layer.from_config = patched_from_config
+    except Exception as e:
+        logger.debug("Could not patch Keras layer deserialization: %s", e)
+
 
 def download_from_huggingface(
     repo_id: str,
@@ -177,6 +199,9 @@ def load_trained_model(
     configure_low_memory_runtime()
     model_path = resolve_model_path(cfg=cfg, custom_path=custom_path)
     logger.info("Loading Keras model from %s...", model_path)
-    model = tf.keras.models.load_model(str(model_path))
+    try:
+        model = tf.keras.models.load_model(str(model_path), compile=False)
+    except Exception:
+        model = tf.keras.models.load_model(str(model_path))
     logger.info("Keras model loaded successfully.")
     return model

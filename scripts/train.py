@@ -28,6 +28,7 @@ from pathlib import Path
 # Ensure repo root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import pandas as pd
 import tensorflow as tf
 
 from src.config import load_config
@@ -99,7 +100,12 @@ def main() -> None:
         train_df = create_fallback_mock_split(cfg, n_samples=32)
         val_df = create_fallback_mock_split(cfg, n_samples=16)
 
-    # 2. Run two-phase training
+    # 2. Ensure precomputed segmented/orig PNG cache is available to eliminate train/serve skew
+    from scripts.precompute_segmented import precompute_dataset
+    combined_training_splits = pd.concat([train_df, val_df], ignore_index=True)
+    precompute_dataset(cfg, smoke_test=args.smoke_test, df=combined_training_splits)
+
+    # 3. Run two-phase training
     run_training(cfg, train_df, val_df, smoke_test=args.smoke_test)
 
 

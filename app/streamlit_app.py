@@ -108,7 +108,7 @@ def render_classifier_tab(predictor: Optional[Predictor]) -> None:
     st.subheader("🔬 Peripheral Blood Smear Classification")
     st.caption("Upload a Giemsa-stained peripheral blood-smear image or select a bundled sample.")
 
-    sample_dir = _REPO_ROOT / "app" / "sample_images"
+    sample_dir = _REPO_ROOT / "app" / "samples"
     sample_options = ["None (Upload custom image)"]
     if sample_dir.exists():
         sample_files = [f.name for f in sample_dir.iterdir() if f.suffix.lower() in [".jpg", ".jpeg", ".png"]]
@@ -142,6 +142,14 @@ def render_classifier_tab(predictor: Optional[Predictor]) -> None:
                 return
             pil_image = Image.open(uploaded_file).convert("RGB")
             image_name = uploaded_file.name
+
+            # Check if image looks already segmented (more than 70% pixels near black)
+            img_arr = np.array(pil_image)
+            is_near_black = np.all(img_arr < 30, axis=-1)
+            black_ratio = float(np.mean(is_near_black))
+            if black_ratio > 0.70:
+                st.warning("This looks like an already-segmented image. Please upload the original blood smear.")
+
         except (UnidentifiedImageError, Exception) as e:
             st.error(f"Invalid image file: {e}. Please upload a valid JPG or PNG image.")
             return

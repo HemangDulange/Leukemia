@@ -41,6 +41,7 @@ from tensorflow import keras
 from src.config import AppConfig, load_config
 from src.data.dataset import build_dataset
 from src.data.splits import make_splits
+from src.inference.model_loader import load_trained_model
 from src.models.dual_stream import build_dual_stream_model
 
 logging.basicConfig(
@@ -165,14 +166,13 @@ def detect_pipeline_differences(
 
 def create_fallback_mock_split(cfg: AppConfig, n_samples: int = 16) -> pd.DataFrame:
     """Create a minimal fallback DataFrame pointing to sample images if raw data is absent."""
-    sample_dir = _REPO_ROOT / "app" / "sample_images"
-    sample_orig = sample_dir / "WBC-Benign-001.jpg"
-    sample_seg = sample_dir / "Seg-WBC-Benign-001.jpg"
+    sample_dir = _REPO_ROOT / "app" / "samples"
+    sample_orig = sample_dir / "Hematogones_sample.jpg"
 
     if not sample_orig.exists():
-        # Fallback to current directory or temp
-        sample_orig = Path("sample_orig.jpg")
-        sample_seg = Path("sample_seg.jpg")
+        # Fallback to any file in app/samples
+        existing_samples = list(sample_dir.glob("*.jpg")) + list(sample_dir.glob("*.png"))
+        sample_orig = existing_samples[0] if existing_samples else Path("sample_orig.jpg")
 
     rows = []
     classes = cfg.data.classes
@@ -180,8 +180,8 @@ def create_fallback_mock_split(cfg: AppConfig, n_samples: int = 16) -> pd.DataFr
         cls_idx = i % len(classes)
         rows.append({
             "original_path": str(sample_orig),
-            "segmented_path": str(sample_seg),
             "label_index": cls_idx,
+            "class_folder": classes[cls_idx],
             "class_name": classes[cls_idx],
             "stem": f"sample_{i}",
         })
@@ -250,7 +250,7 @@ def run_sanity_check(
     if target_model_path.exists() and target_model_path.is_file() and not smoke_test:
         try:
             logger.info("Loading model from %s...", target_model_path)
-            model = keras.models.load_model(str(target_model_path))
+            model = load_trained_model(cfg, custom_path=target_model_path)
             logger.info("Model loaded successfully.")
         except Exception as err:
             logger.warning("Could not load saved model (%s). Building dual-stream model...", err)

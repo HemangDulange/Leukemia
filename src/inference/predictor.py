@@ -3,11 +3,11 @@ Single-image inference engine for the ALL Dual-Stream Classifier.
 
 Loads the trained model and canonical class metadata once, then exposes
 ``predict(pil_image) -> dict`` which reuses the exact preprocessing pipeline:
-1. Converts PIL Image to BGR for OpenCV.
-2. Applies HSV color threshold segmentation (segment_image from src.preprocessing.segmentation).
-3. Resizes and normalizes both streams with EfficientNet scaling ([-1, 1]).
-4. Runs dual-input model forward pass.
-5. Computes Grad-CAM heatmap overlay from the segmented stream's final conv layer.
+1. Calls src.preprocessing.pair:prepare_pair on the full-resolution RGB image.
+2. Formats both streams into (1, 224, 224, 3) float32 in [0, 255] (matching training).
+3. Runs dual-input model forward pass.
+4. Computes Grad-CAM heatmap overlay from the segmented stream's final conv layer.
+5. Emits preview PIL images (original, segmented, mask, gradcam) derived from the exact same output.
 """
 from __future__ import annotations
 
@@ -23,8 +23,7 @@ import tensorflow as tf
 
 from src.config import AppConfig, load_config
 from src.evaluation.gradcam import compute_gradcam_heatmap, overlay_heatmap
-from src.preprocessing.normalization import normalize
-from src.preprocessing.segmentation import segment_image
+from src.preprocessing.pair import prepare_pair
 
 logger = logging.getLogger(__name__)
 
@@ -78,46 +77,12 @@ class Predictor:
             "index_to_display": {str(i): display_mapping.get(c, c) for i, c in enumerate(classes)},
         }
 
-    def _preprocess_input(
-        self,
-        bgr_image: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Process image through exact preprocessing pipeline.
-
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
-            ``(orig_norm_batch, seg_norm_batch, binary_mask, seg_rgb)``
-        """
-        size = self._cfg.image.size
-
-        # 1. Exact HSV color threshold segmentation (background -> black)
-        binary_mask, seg_bgr = segment_image(bgr_image, self._cfg)
-
-        # 2. Convert to RGB
-        orig_rgb = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-        seg_rgb = cv2.cvtColor(seg_bgr, cv2.COLOR_BGR2RGB)
-
-        # 3. Resize
-        orig_resized = cv2.resize(orig_rgb, (size, size), interpolation=cv2.INTER_LINEAR)
-        seg_resized = cv2.resize(seg_rgb, (size, size), interpolation=cv2.INTER_LINEAR)
-
-        # 4. Ensure float32 in [0, 255] for EfficientNet backbones (which contain internal Rescaling)
-        orig_norm = normalize(orig_resized.astype(np.float32))
-        seg_norm = normalize(seg_resized.astype(np.float32))
-
-        # Add batch dimension: (1, H, W, 3)
-        orig_batch = np.expand_dims(orig_norm, axis=0)
-        seg_batch = np.expand_dims(seg_norm, axis=0)
-
-        return orig_batch, seg_batch, binary_mask, seg_rgb
-
     def predict(
         self,
         image: Union[Image.Image, np.ndarray, str, Path],
         generate_gradcam: bool = True,
     ) -> Dict[str, Any]:
-        """Run single-image inference and return comprehensive predictions.
+        """Run single-image inference using shared prepare_pair preprocessing.
 
         Parameters
         ----------
@@ -142,46 +107,47 @@ class Predictor:
             - ``gradcam_overlay``: Grad-CAM overlay PIL Image (or None).
             - ``confidence``: Probability of top predicted class.
         """
-        # Convert input to BGR numpy array for OpenCV routines
+        # 1. Standardize input to PIL Image in RGB format
         if isinstance(image, (str, Path)):
-            bgr = cv2.imread(str(image), cv2.IMREAD_COLOR)
-            if bgr is None:
-                raise ValueError(f"Could not load image file from {image}")
-            orig_pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            pil_image = Image.open(str(image)).convert("RGB")
         elif isinstance(image, Image.Image):
-            orig_pil = image.convert("RGB")
-            rgb_arr = np.array(orig_pil)
-            bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
+            pil_image = image.convert("RGB")
         elif isinstance(image, np.ndarray):
             if image.ndim != 3 or image.shape[2] != 3:
                 raise ValueError(f"Expected 3-channel image array, got shape {image.shape}")
-            # If dtype is float in [0, 1], scale to uint8
             if np.issubdtype(image.dtype, np.floating) and image.max() <= 1.0:
-                image = (image * 255).astype(np.uint8)
+                uint8_arr = (image * 255).astype(np.uint8)
             else:
-                image = image.astype(np.uint8)
-            # Assume RGB array from PIL/standard loaders
-            orig_pil = Image.fromarray(image)
-            bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                uint8_arr = image.astype(np.uint8)
+            pil_image = Image.fromarray(uint8_arr)
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
 
-        # 1. Preprocess both streams
-        orig_batch, seg_batch, binary_mask, seg_rgb = self._preprocess_input(bgr)
+        # 2. Shared preprocessing via prepare_pair (eliminates train/serve skew)
+        orig_arr, seg_arr, mask_arr = prepare_pair(
+            pil_image,
+            cfg=self._cfg,
+            target_size=self._cfg.image.size,
+            return_mask=True,
+        )
 
-        # 2. Dual-input model forward pass
+        # 3. Add batch dimension: (1, H, W, 3) float32 in [0, 255]
+        orig_batch = np.expand_dims(orig_arr, axis=0)
+        seg_batch = np.expand_dims(seg_arr, axis=0)
+
+        # 4. Dual-input model forward pass
         proba = self._model.predict(
             {"original": orig_batch, "segmented": seg_batch},
             verbose=0,
         )[0]
 
-        # 3. Extract top class
+        # 5. Extract top class
         label_idx = int(np.argmax(proba))
         folder_name = self._class_meta["index_to_folder"][str(label_idx)]
         display_name = self._class_meta["index_to_display"][str(label_idx)]
         confidence = float(proba[label_idx])
 
-        # 4. Format probability distributions
+        # 6. Format probability distributions
         prob_dict: Dict[str, float] = {}
         prob_list: List[Tuple[str, float]] = []
         for i, p in enumerate(proba):
@@ -190,17 +156,15 @@ class Predictor:
             prob_dict[c_name] = round(val, 4)
             prob_list.append((c_name, val))
 
-        # 5. Convert visual outputs to PIL images
-        size = self._cfg.image.size
-        orig_rgb_resized = cv2.resize(np.array(orig_pil), (size, size), interpolation=cv2.INTER_LINEAR)
-        seg_rgb_resized = cv2.resize(seg_rgb, (size, size), interpolation=cv2.INTER_LINEAR)
-        mask_resized = cv2.resize(binary_mask, (size, size), interpolation=cv2.INTER_NEAREST)
+        # 7. Convert visual outputs directly from the prepare_pair results
+        orig_uint8 = np.clip(orig_arr, 0.0, 255.0).astype(np.uint8)
+        seg_uint8 = np.clip(seg_arr, 0.0, 255.0).astype(np.uint8)
 
-        segmented_pil = Image.fromarray(seg_rgb_resized)
-        mask_pil = Image.fromarray(mask_resized)
-        original_pil = Image.fromarray(orig_rgb_resized)
+        original_pil = Image.fromarray(orig_uint8)
+        segmented_pil = Image.fromarray(seg_uint8)
+        mask_pil = Image.fromarray(mask_arr.astype(np.uint8))
 
-        # 6. Grad-CAM overlay from segmented-stream backbone
+        # 8. Grad-CAM overlay from segmented-stream backbone
         gradcam_pil = None
         if generate_gradcam:
             try:
@@ -210,10 +174,10 @@ class Predictor:
                     seg_tensor=seg_batch,
                     class_idx=label_idx,
                 )
-                overlay_rgb = overlay_heatmap(heatmap, orig_rgb_resized, alpha=0.45)
-                gradcam_pil = Image.fromarray(overlay_rgb)
+                overlay_bgr = overlay_heatmap(heatmap, orig_uint8, alpha=0.45)
+                gradcam_pil = Image.fromarray(overlay_bgr)
             except Exception as e:
-                logger.warning("Grad-CAM generation failed: %s", e)
+                logger.warning("Could not generate Grad-CAM overlay: %s", e)
 
         return {
             "predicted_label": display_name,
@@ -224,7 +188,6 @@ class Predictor:
             "class_probabilities": prob_dict,
             "probabilities": prob_list,
             "segmented_image": segmented_pil,
-            "masked_image": seg_rgb_resized,
             "mask": mask_pil,
             "original_image": original_pil,
             "gradcam_overlay": gradcam_pil,

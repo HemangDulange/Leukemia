@@ -5,27 +5,30 @@ Builds optimized input pipelines yielding:
     ({"original": x_orig, "segmented": x_seg}, one_hot_label)
 
 Features:
-- Stream B: Original blood-smear image (resized, normalized).
-- Stream A: Segmented image via HSV color thresholding (clean binary mask imposed, background black).
+- Stream B: Original blood-smear image from cached processed PNGs.
+- Stream A: Segmented image from cached processed PNGs (created by prepare_pair).
+  NEVER reads from the dataset's pre-made Segmented/ directory to guarantee train/serve symmetry.
 - Training split: Joint spatial augmentation (RandomFlip, RandomRotation, RandomZoom) across both
   streams, plus RandomContrast on original stream only.
-- Validation / Test split: Strictly deterministic preprocessing without augmentation.
+- Validation / Test split: Strictly deterministic without augmentation.
 - Reproducible seed 42 with prefetching and parallel execution.
 """
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Dict, Tuple
 
 import cv2
 import numpy as np
 import pandas as pd
+from PIL import Image
 import tensorflow as tf
 
 from src.config import AppConfig
 from src.preprocessing.augmentation import augment_pair
 from src.preprocessing.normalization import normalize
-from src.preprocessing.segmentation import segment_image
+from src.preprocessing.pair import prepare_pair
 
 logger = logging.getLogger(__name__)
 
@@ -39,33 +42,38 @@ def _load_and_preprocess_pair(
     img_size: int,
     cfg: AppConfig,
 ) -> Tuple[Tuple[tf.Tensor, tf.Tensor], tf.Tensor]:
-    """Load original image, compute HSV segmentation, resize, and normalize."""
+    """Load cached orig/seg PNGs, or generate on-the-fly using prepare_pair if cache is missing."""
 
     def _py_func(op_bytes, sp_bytes) -> Tuple[np.ndarray, np.ndarray]:
-        path_str = op_bytes.numpy().decode() if hasattr(op_bytes, "numpy") else op_bytes.decode()
-        orig_bgr = cv2.imread(path_str, cv2.IMREAD_COLOR)
+        op_str = op_bytes.numpy().decode() if hasattr(op_bytes, "numpy") else op_bytes.decode()
+        sp_str = sp_bytes.numpy().decode() if hasattr(sp_bytes, "numpy") else sp_bytes.decode()
 
-        # Attempt to load pre-segmented image if provided
-        seg_path_str = sp_bytes.numpy().decode() if hasattr(sp_bytes, "numpy") else sp_bytes.decode()
-        seg_bgr = cv2.imread(seg_path_str, cv2.IMREAD_COLOR) if seg_path_str else None
+        # 1. Try reading the cached PNG files directly
+        orig_bgr = cv2.imread(op_str, cv2.IMREAD_COLOR) if op_str else None
+        seg_bgr = cv2.imread(sp_str, cv2.IMREAD_COLOR) if sp_str else None
 
-        if orig_bgr is None:
-            # Fallback zero-filled array if file read failed
-            orig_bgr = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-            seg_bgr = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-        elif seg_bgr is None:
-            # Segment using HSV color threshold pipeline
-            _, seg_bgr = segment_image(orig_bgr, cfg)
+        if orig_bgr is not None and seg_bgr is not None:
+            orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
+            seg_rgb = cv2.cvtColor(seg_bgr, cv2.COLOR_BGR2RGB)
 
-        # Convert to RGB
-        orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
-        seg_rgb = cv2.cvtColor(seg_bgr, cv2.COLOR_BGR2RGB)
+            if orig_rgb.shape[0] != img_size or orig_rgb.shape[1] != img_size:
+                orig_rgb = cv2.resize(orig_rgb, (img_size, img_size), interpolation=cv2.INTER_AREA)
+            if seg_rgb.shape[0] != img_size or seg_rgb.shape[1] != img_size:
+                seg_rgb = cv2.resize(seg_rgb, (img_size, img_size), interpolation=cv2.INTER_AREA)
 
-        # Resize to model input shape
-        orig_resized = cv2.resize(orig_rgb, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
-        seg_resized = cv2.resize(seg_rgb, (img_size, img_size), interpolation=cv2.INTER_LINEAR)
+            return orig_rgb.astype(np.float32), seg_rgb.astype(np.float32)
 
-        return orig_resized.astype(np.float32), seg_resized.astype(np.float32)
+        # 2. Fallback: load original image and segment on-the-fly via prepare_pair
+        if op_str and Path(op_str).exists():
+            try:
+                pil_img = Image.open(op_str).convert("RGB")
+                orig_arr, seg_arr = prepare_pair(pil_img, cfg=cfg, target_size=img_size)
+                return orig_arr, seg_arr
+            except Exception as e:
+                logger.error("Error reading/preparing %s: %s", op_str, e)
+
+        # 3. Fallback: zero-filled array if file read failed
+        return np.zeros((img_size, img_size, 3), dtype=np.float32), np.zeros((img_size, img_size, 3), dtype=np.float32)
 
     orig_arr, seg_arr = tf.py_function(
         func=_py_func,
@@ -88,19 +96,22 @@ def build_dataset(
     cfg: AppConfig,
     split: str,
     smoke_test: bool = False,
+    img_size: Optional[int] = None,
 ) -> tf.data.Dataset:
     """Build a ``tf.data.Dataset`` yielding ({"original": x_orig, "segmented": x_seg}, label).
 
     Parameters
     ----------
     df:
-        DataFrame containing ``original_path``, ``segmented_path``, and ``label_index``.
+        DataFrame containing ``original_path`` and ``label_index``.
     cfg:
         Application configuration.
     split:
         One of ``"train"``, ``"val"``, or ``"test"``.
     smoke_test:
         If ``True``, samples a small subset and uses ``cfg.image.smoke_test_size``.
+    img_size:
+        Optional explicit image resolution. If None, uses smoke_test_size or cfg.image.size.
 
     Returns
     -------
@@ -109,7 +120,8 @@ def build_dataset(
         ``({"original": batch_orig, "segmented": batch_seg}, batch_labels)``
     """
     is_train = split == "train"
-    img_size = cfg.image.smoke_test_size if smoke_test else cfg.image.size
+    if img_size is None:
+        img_size = cfg.image.smoke_test_size if smoke_test else cfg.image.size
     batch_size = cfg.training.batch_size
     n_classes = cfg.model.num_classes
 
@@ -125,8 +137,30 @@ def build_dataset(
     if len(df) == 0:
         logger.warning("Empty dataframe passed for %s split.", split)
 
-    orig_paths = df["original_path"].astype(str).values
-    seg_paths = df["segmented_path"].astype(str).values
+    # Resolve paths to cached data/processed/orig/ and data/processed/seg/
+    orig_paths_list = []
+    seg_paths_list = []
+    processed_orig_root = cfg.data.processed_dir / "orig"
+    processed_seg_root = cfg.data.processed_dir / "seg"
+
+    for _, row in df.iterrows():
+        raw_path = Path(str(row["original_path"]))
+        class_folder = str(row.get("class_folder") or raw_path.parent.name)
+        stem = raw_path.stem
+
+        cached_orig = processed_orig_root / class_folder / f"{stem}.png"
+        cached_seg = processed_seg_root / class_folder / f"{stem}.png"
+
+        if cached_orig.exists() and cached_seg.exists():
+            orig_paths_list.append(str(cached_orig))
+            seg_paths_list.append(str(cached_seg))
+        else:
+            # Fallback to source path; _load_and_preprocess_pair will call prepare_pair on-the-fly
+            orig_paths_list.append(str(raw_path))
+            seg_paths_list.append("")
+
+    orig_paths = np.array(orig_paths_list, dtype=object)
+    seg_paths = np.array(seg_paths_list, dtype=object)
     labels = df["label_index"].values.astype(np.int32)
 
     ds = tf.data.Dataset.from_tensor_slices((orig_paths, seg_paths, labels))

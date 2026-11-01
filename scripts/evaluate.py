@@ -43,6 +43,7 @@ from src.evaluation.plots import (
     plot_roc_curves,
     plot_training_history,
 )
+from src.inference.model_loader import load_trained_model
 
 logging.basicConfig(
     level=logging.INFO,
@@ -192,15 +193,20 @@ def main() -> None:
         sys.exit(1)
 
     logger.info("Loading model from %s...", model_path)
-    model = tf.keras.models.load_model(str(model_path))
+    model = load_trained_model(cfg, custom_path=model_path)
 
     # 3. Load fixed test dataset
     _, _, test_df = make_splits(cfg)
     if len(test_df) == 0:
-        logger.error("Test split in %s has 0 rows. Prepare data first.", cfg.data.splits_dir)
-        sys.exit(1)
+        if args.smoke_test:
+            from scripts.sanity_check import create_fallback_mock_split
+            logger.warning("Test split has 0 rows. Using fallback samples for smoke-test.")
+            test_df = create_fallback_mock_split(cfg, n_samples=16)
+        else:
+            logger.error("Test split in %s has 0 rows. Prepare data first.", cfg.data.splits_dir)
+            sys.exit(1)
 
-    test_ds = build_dataset(test_df, cfg, split="test", smoke_test=args.smoke_test)
+    test_ds = build_dataset(test_df, cfg, split="test", smoke_test=args.smoke_test, img_size=cfg.image.size)
 
     # 4. Predict on full dual-stream model
     logger.info("Generating predictions on test set (%d samples)...", len(test_df))

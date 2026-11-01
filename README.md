@@ -63,8 +63,27 @@ All models, scripts, and evaluation metrics enforce canonical class ordering via
 |:-----------:|:---------------:|:---------------------:|:------------|
 | **0** | `Benign` | **Hematogones** | Normal B-cell precursors (non-leukemic control) |
 | **1** | `Early` | **Early Pre-B ALL** | Early precursor B-cell Acute Lymphoblastic Leukemia |
-| **2** | `Pre-B` | **Pre-B ALL** | Pre-B Acute Lymphoblastic Leukemia |
+| **2** | `Pre` | **Pre-B ALL** | Pre-B Acute Lymphoblastic Leukemia |
 | **3** | `Pro` | **Pro-B ALL** | Pro-B Acute Lymphoblastic Leukemia |
+
+---
+
+## 🔬 Unified Preprocessing & Zero Train/Serve Skew
+
+To prevent train/serve skew (where the offline model trains on third-party pre-segmented images while live serving generates fresh segmentation masks), the pipeline unifies all image processing in [`src/preprocessing/pair.py`](src/preprocessing/pair.py):
+
+- **Single Pipeline Function (`prepare_pair`)**:
+  Both training and real-time Streamlit inference execute the exact same sequence:
+  1. Input is loaded via PIL `.convert("RGB")`.
+  2. Full-resolution RGB image is passed to `segment_image()` (handling BGR/RGB color channels consistently and applying dual-range HSV color thresholding + morphological filtering).
+  3. Both the original smear and segmented cell images are resized to $224 \times 224$ using area interpolation (`cv2.INTER_AREA`).
+  4. Pixel values are kept as `float32` in the raw $[0, 255]$ range, matching Keras EfficientNet's internal Rescaling layer.
+- **Offline Precomputation (`scripts/precompute_segmented.py`)**:
+  Before training, lossless PNG pairs are generated in `data/processed/orig/<class>/` and `data/processed/seg/<class>/`. The dataset loader (`src/data/dataset.py`) reads directly from this cache, never touching raw pre-made `Segmented/` folders.
+- **Serving Skew Verification (`scripts/check_serving_skew.py`)**:
+  An automated CI/CD check evaluates the test set image bytes through `Predictor` and asserts test accuracy remains within $\le 1.5\%$ of batch evaluation.
+- **Pre-segmented Upload Protection**:
+  The Streamlit app checks uploaded smears: if $>70\%$ of pixels are near-black, it warns the user: *"This looks like an already-segmented image. Please upload the original blood smear."*
 
 ---
 
@@ -100,7 +119,7 @@ streamlit run app/streamlit_app.py
 ```
 
 The application opens at `http://localhost:8501`.
-- **Bundled Samples**: Test immediately with preloaded peripheral blood-smear samples in `app/sample_images/`.
+- **Bundled Samples**: Test immediately with preloaded peripheral blood-smear samples in `app/samples/`.
 - **Visual Explainability**: Side-by-side inspection across Original Smear, HSV Mask, Segmented Cell, and Grad-CAM Activation Heatmap.
 - **Model Loading**: Automatically searches for local weights at `models/dual_stream.keras`; if absent, safely downloads published weights from Hugging Face Hub.
 
@@ -185,21 +204,25 @@ leukemia-all-classifier/
 │   └── config.toml             # Dark theme & upload security settings
 ├── configs/
 │   └── config.yaml             # Single source of truth (paths, thresholds, hyperparameters)
-├── data/                       # Gitignored dataset directory
-│   ├── raw/{Original, Segmented}
+├── data/                       # Dataset directory (gitignored)
+│   ├── raw/Original            # Raw blood smear images
+│   ├── processed/              # Lossless precomputed PNGs (zero train/serve skew)
+│   │   ├── orig/<class>/
+│   │   └── seg/<class>/
 │   └── splits/{train, val, test}.csv
 ├── notebooks/
 │   └── kaggle_train.ipynb      # End-to-end Kaggle GPU training notebook
 ├── src/                        # Core modular library
 │   ├── config.py               # Typed AppConfig loader
 │   ├── data/
-│   │   ├── pairing.py          # Matches Original & Segmented pairs; reports unmatched
+│   │   ├── pairing.py          # Matches Original pairs & generates labels
 │   │   ├── splits.py           # Stratified split generator & class-weight computation
-│   │   └── dataset.py          # Dual-input tf.data pipeline
+│   │   └── dataset.py          # Dual-input tf.data pipeline reading processed cache
 │   ├── preprocessing/
+│   │   ├── pair.py             # Single unified prepare_pair function (train & serve)
 │   │   ├── segmentation.py     # BGR->HSV thresholding & morphological filtering
 │   │   ├── normalization.py    # EfficientNet scaling & Reinhard stain transfer
-│   │   └── augmentation.py     # Joint spatial Keras augmentation layers
+│   │   └── augmentation.py     # Joint spatial Keras augmentation layers (train-only)
 │   ├── models/
 │   │   ├── backbones.py        # Backbone factory (EfficientNetB0-B5, GAP)
 │   │   └── dual_stream.py      # Dual-stream functional model & unfreezing utilities
@@ -214,13 +237,16 @@ leukemia-all-classifier/
 │       ├── model_loader.py     # Local model loader with Hugging Face Hub download fallback
 │       └── predictor.py        # Production inference engine used by Streamlit
 ├── scripts/                    # CLI commands
-│   ├── prepare_data.py
-│   ├── train.py
-│   ├── evaluate.py
-│   └── predict.py
+│   ├── prepare_data.py         # Generate stratified CSV splits
+│   ├── precompute_segmented.py # Precompute unified PNG pairs
+│   ├── train.py                # Train model (calls precompute automatically if needed)
+│   ├── evaluate.py             # Evaluate test split performance & metrics
+│   ├── check_serving_skew.py   # Verify live Predictor vs offline pipeline parity (<=1.5%)
+│   ├── make_samples.py         # Pick 1 sample per class & bundle samples.zip
+│   └── predict.py              # CLI batch inference
 ├── app/
 │   ├── streamlit_app.py        # Interactive Streamlit application
-│   ├── sample_images/          # Bundled PBS smear test samples
+│   ├── samples/                # Bundled PBS smear test samples for live app
 │   └── components/             # Modular UI components
 ├── models/
 │   ├── class_names.json        # Canonical class ordering & display names

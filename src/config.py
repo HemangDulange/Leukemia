@@ -30,6 +30,7 @@ class DataConfig:
     classes: List[str]
     val_fraction: float
     test_fraction: float
+    processed_dir: Path = field(default_factory=lambda: _REPO_ROOT / "data" / "processed")
 
 
 @dataclass
@@ -166,6 +167,7 @@ def load_config(config_path: Path | str | None = None) -> AppConfig:
     root = _REPO_ROOT
 
     data_raw = raw["data"]
+    processed_val = data_raw.get("processed_dir", "data/processed")
     data = DataConfig(
         raw_dir=root / data_raw["raw_dir"],
         splits_dir=root / data_raw["splits_dir"],
@@ -174,6 +176,7 @@ def load_config(config_path: Path | str | None = None) -> AppConfig:
         classes=data_raw["classes"],
         val_fraction=data_raw["val_fraction"],
         test_fraction=data_raw["test_fraction"],
+        processed_dir=root / processed_val,
     )
 
     img_raw = raw["image"]

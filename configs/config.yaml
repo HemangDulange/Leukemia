@@ -5,6 +5,7 @@ seed: 42
 data:
   raw_dir: data/raw
   splits_dir: data/splits
+  processed_dir: data/processed
   original_subdir: Original
   segmented_subdir: Segmented
   # Canonical class order  (folder name → display name handled in class_names.json)
