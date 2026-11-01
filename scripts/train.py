@@ -93,6 +93,11 @@ def main() -> None:
 
     # 1. Load or generate stratified splits
     train_df, val_df, _ = make_splits(cfg, force=args.force_splits)
+    if args.smoke_test and (len(train_df) == 0 or len(val_df) == 0):
+        from scripts.sanity_check import create_fallback_mock_split
+        logger.warning("No dataset found on disk; using fallback mock samples for smoke-test verification.")
+        train_df = create_fallback_mock_split(cfg, n_samples=32)
+        val_df = create_fallback_mock_split(cfg, n_samples=16)
 
     # 2. Run two-phase training
     run_training(cfg, train_df, val_df, smoke_test=args.smoke_test)

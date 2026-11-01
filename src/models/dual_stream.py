@@ -87,8 +87,10 @@ def build_dual_stream_model(
     )
 
     # 3. Feature extraction (each backbone already has Global Average Pooling)
-    feat_orig = backbone_orig(input_orig)
-    feat_seg = backbone_seg(input_seg)
+    # Frozen backbones MUST run in inference mode (training=False) so BatchNorm
+    # running statistics are not corrupted by training batches during Phase 1.
+    feat_orig = backbone_orig(input_orig, training=False)
+    feat_seg = backbone_seg(input_seg, training=False)
 
     # 4. Fusion via Concatenate
     concat = keras.layers.Concatenate(name="concat_fusion")([feat_orig, feat_seg])
@@ -141,6 +143,7 @@ def unfreeze_backbone_layers(
     model: keras.Model,
     unfreeze_top_n: int = 20,
     learning_rate: float = 1e-5,
+    label_smoothing: float = 0.0,
 ) -> keras.Model:
     """Unfreeze the top N layers of both backbones for fine-tuning and recompile with lower LR.
 
@@ -152,6 +155,8 @@ def unfreeze_backbone_layers(
         Number of top layers to unfreeze in each backbone.
     learning_rate:
         Fine-tuning learning rate (typically 1e-5 to 1e-6).
+    label_smoothing:
+        Label smoothing factor for CategoricalCrossentropy loss.
 
     Returns
     -------
@@ -162,11 +167,15 @@ def unfreeze_backbone_layers(
         if isinstance(layer, keras.Model) and ("orig_backbone" in layer.name or "seg_backbone" in layer.name):
             set_trainable_layers(layer, unfreeze_top_n=unfreeze_top_n)
 
-    # Recompile with lower learning rate for gentle fine-tuning
+    # Recompile with fresh metric instances to prevent Keras internal Mean metric collisions.
+    # Never reuse model.metrics or Phase 1 metric objects.
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
-        loss=model.loss,
-        metrics=model.metrics,
+        loss=keras.losses.CategoricalCrossentropy(label_smoothing=label_smoothing),
+        metrics=[
+            keras.metrics.CategoricalAccuracy(name="accuracy"),
+            keras.metrics.AUC(name="auc", multi_label=False),
+        ],
     )
 
     trainable_count = sum(tf.size(v).numpy() for v in model.trainable_variables)

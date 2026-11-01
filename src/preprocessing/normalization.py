@@ -178,41 +178,44 @@ def resize_and_rescale(
     # Resize
     resized = cv2.resize(work, target_size, interpolation=cv2.INTER_LINEAR)
 
-    # Rescale to [-1, 1] (EfficientNet expected scaling)
-    float_img = resized.astype(np.float32)
-    return (float_img / 127.5) - 1.0
+    # Return float32 in [0, 255] for EfficientNet internal Rescaling
+    return resized.astype(np.float32)
 
 
 def normalize(image: Union[tf.Tensor, np.ndarray]) -> Union[tf.Tensor, np.ndarray]:
-    """Normalise an image tensor or array to [-1, 1] for EfficientNet backbones.
+    """Ensure image is float32 in [0, 255] for Keras EfficientNet backbones.
+
+    Keras EfficientNet architectures include built-in Rescaling(1/255) and
+    Normalization layers, so the model expects raw pixel values in [0, 255].
 
     Parameters
     ----------
     image:
-        Float32 tensor or array of shape ``(H, W, 3)`` with pixel values in
-        ``[0, 255]``.
+        Tensor or array of shape ``(H, W, 3)`` with pixel values in ``[0, 255]``.
 
     Returns
     -------
     tf.Tensor or np.ndarray
-        Normalised float32 tensor or array in ``[-1, 1]``.
+        Float32 tensor or array in ``[0, 255]``.
     """
     if isinstance(image, tf.Tensor):
-        return tf.keras.applications.efficientnet.preprocess_input(image)
-    return (np.asarray(image, dtype=np.float32) / 127.5) - 1.0
+        return tf.cast(image, tf.float32)
+    return np.asarray(image, dtype=np.float32)
 
 
 def denormalize(image: Union[tf.Tensor, np.ndarray]) -> Union[tf.Tensor, np.ndarray]:
-    """Reverse EfficientNet normalisation back to ``[0, 255]``.
+    """Convert float32 image in [0, 255] back to uint8.
 
     Parameters
     ----------
     image:
-        Float32 tensor or array in ``[-1, 1]``.
+        Float32 tensor or array in ``[0, 255]``.
 
     Returns
     -------
     tf.Tensor or np.ndarray
-        Float32 image with pixel values in ``[0, 255]``.
+        Uint8 image with pixel values in ``[0, 255]``.
     """
-    return (image + 1.0) * 127.5
+    if isinstance(image, tf.Tensor):
+        return tf.clip_by_value(image, 0.0, 255.0)
+    return np.clip(image, 0.0, 255.0).astype(np.uint8)

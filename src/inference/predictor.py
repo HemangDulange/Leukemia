@@ -102,7 +102,7 @@ class Predictor:
         orig_resized = cv2.resize(orig_rgb, (size, size), interpolation=cv2.INTER_LINEAR)
         seg_resized = cv2.resize(seg_rgb, (size, size), interpolation=cv2.INTER_LINEAR)
 
-        # 4. Normalize to [-1, 1] for EfficientNet backbones
+        # 4. Ensure float32 in [0, 255] for EfficientNet backbones (which contain internal Rescaling)
         orig_norm = normalize(orig_resized.astype(np.float32))
         seg_norm = normalize(seg_resized.astype(np.float32))
 

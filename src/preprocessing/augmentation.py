@@ -96,16 +96,17 @@ def augment_pair(
     cfg: AppConfig,
     training: bool = True,
 ) -> Tuple[Tuple[tf.Tensor, tf.Tensor], tf.Tensor]:
-    """Apply Keras layer augmentations to a (stream_A, stream_B) pair.
+    """Apply Keras layer augmentations to an (original, segmented) pair.
 
-    Jointly transforms Stream A (masked) and Stream B (original) along channels
+    Jointly transforms Stream original and Stream segmented along channels
     so that geometric distortions (flip, rotation, zoom) match exactly.
-    Then applies contrast augmentation to Stream B.
+    Then applies contrast augmentation to the original stream only.
+    Both streams are maintained strictly in [0.0, 255.0].
 
     Parameters
     ----------
     imgs:
-        Tuple of ``(stream_a, stream_b)`` tensors with shape ``(H, W, 3)`` in ``[-1, 1]``.
+        Tuple of ``(stream_orig, stream_seg)`` tensors with shape ``(H, W, 3)`` in ``[0, 255]``.
     label:
         Label tensor (passed through unchanged).
     cfg:
@@ -116,31 +117,34 @@ def augment_pair(
     Returns
     -------
     Tuple[Tuple[tf.Tensor, tf.Tensor], tf.Tensor]
-        Augmented ``((stream_a, stream_b), label)``.
+        Augmented ``((stream_orig, stream_seg), label)`` in ``[0, 255]``.
     """
     if not training:
         return imgs, label
 
-    stream_a, stream_b = imgs
+    stream_orig, stream_seg = imgs
     geom_model, contrast_layer = _get_pair_augmenters(cfg)
 
     # Concatenate along channel dimension: (H, W, 6)
     # This allows joint geometric transformations with identical random parameters
-    concat_img = tf.concat([stream_a, stream_b], axis=-1)
+    concat_img = tf.concat([stream_orig, stream_seg], axis=-1)
     # Add batch dimension for Keras layer: (1, H, W, 6)
     batched = tf.expand_dims(concat_img, axis=0)
 
     aug_batched = geom_model(batched, training=True)
     aug_concat = tf.squeeze(aug_batched, axis=0)
 
-    # Split back into Stream A (0:3) and Stream B (3:6)
-    aug_stream_a = aug_concat[..., 0:3]
-    aug_stream_b = aug_concat[..., 3:6]
+    # Split back into Stream Orig (0:3) and Stream Seg (3:6)
+    aug_orig = aug_concat[..., 0:3]
+    aug_seg = aug_concat[..., 3:6]
 
-    # Contrast layer on Stream B (original stream)
-    aug_stream_b_batched = tf.expand_dims(aug_stream_b, axis=0)
-    aug_stream_b_contrast = contrast_layer(aug_stream_b_batched, training=True)
-    aug_stream_b = tf.squeeze(aug_stream_b_contrast, axis=0)
-    aug_stream_b = tf.clip_by_value(aug_stream_b, -1.0, 1.0)
+    # Contrast layer on original stream only
+    aug_orig_batched = tf.expand_dims(aug_orig, axis=0)
+    aug_orig_contrast = contrast_layer(aug_orig_batched, training=True)
+    aug_orig = tf.squeeze(aug_orig_contrast, axis=0)
 
-    return (aug_stream_a, aug_stream_b), label
+    # Clip both streams to valid [0.0, 255.0] range
+    aug_orig = tf.clip_by_value(aug_orig, 0.0, 255.0)
+    aug_seg = tf.clip_by_value(aug_seg, 0.0, 255.0)
+
+    return (aug_orig, aug_seg), label

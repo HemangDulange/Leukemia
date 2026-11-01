@@ -76,7 +76,7 @@ def _load_and_preprocess_pair(
     orig_arr.set_shape([img_size, img_size, 3])
     seg_arr.set_shape([img_size, img_size, 3])
 
-    # Normalize to [-1, 1] for EfficientNet backbones
+    # Ensure float32 in [0, 255] for EfficientNet backbones (which contain internal Rescaling)
     orig_norm = normalize(orig_arr)
     seg_norm = normalize(seg_arr)
 
@@ -149,7 +149,7 @@ def build_dataset(
         ds = ds.map(
             lambda imgs, lbl: (
                 augment_pair(
-                    (imgs[1], imgs[0]),  # (segmented, original)
+                    (imgs[0], imgs[1]),  # (original, segmented)
                     lbl,
                     cfg,
                     training=True,
@@ -157,9 +157,8 @@ def build_dataset(
             ),
             num_parallel_calls=_AUTOTUNE,
         )
-        # Re-unpack into (original, segmented) format
         ds = ds.map(
-            lambda imgs, lbl: ({"original": imgs[1], "segmented": imgs[0]}, tf.one_hot(lbl, n_classes)),
+            lambda imgs, lbl: ({"original": imgs[0], "segmented": imgs[1]}, tf.one_hot(lbl, n_classes)),
             num_parallel_calls=_AUTOTUNE,
         )
     else:

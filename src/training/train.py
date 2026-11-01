@@ -163,8 +163,8 @@ def run_training(
     # =========================================================================
     # PHASE 2: Unfreeze top 30 backbone layers at lr 1e-5
     # =========================================================================
-    if not smoke_test and cfg.training.phase2_epochs > 0:
-        p2_epochs = cfg.training.phase2_epochs
+    if cfg.training.phase2_epochs > 0:
+        p2_epochs = 1 if smoke_test else cfg.training.phase2_epochs
         p2_lr = cfg.training.phase2_lr
         unfreeze_n = cfg.training.unfreeze_top_n
 
@@ -173,11 +173,12 @@ def run_training(
         print(f"Learning rate: {p2_lr} | Epochs: {p2_epochs}")
         print("=" * 65)
 
-        # Unfreeze top N layers of both backbones & compile with lr 1e-5
+        # Unfreeze top N layers of both backbones & compile with lr 1e-5 and fresh metric instances
         model = unfreeze_backbone_layers(
             model,
             unfreeze_top_n=unfreeze_n,
             learning_rate=p2_lr,
+            label_smoothing=cfg.training.label_smoothing,
         )
 
         callbacks_p2 = build_callbacks(

@@ -1,11 +1,15 @@
 {
-  "class_order": ["Benign", "Early", "Pre", "Pro"],
+  "class_order": [
+    "Benign",
+    "Early",
+    "Pre",
+    "Pro"
+  ],
   "display_names": {
     "Benign": "Hematogones",
-    "Early":  "Early Pre-B ALL",
-    "Pre":    "Pre-B ALL",
-    "Pre-B":  "Pre-B ALL",
-    "Pro":    "Pro-B ALL"
+    "Early": "Early Pre-B ALL",
+    "Pre": "Pre-B ALL",
+    "Pro": "Pro-B ALL"
   },
   "index_to_folder": {
     "0": "Benign",
