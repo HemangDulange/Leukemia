@@ -1,0 +1,88 @@
+# ── Global ──────────────────────────────────────────────────────────────────
+seed: 42
+
+# ── Data ────────────────────────────────────────────────────────────────────
+data:
+  raw_dir: data/raw
+  splits_dir: data/splits
+  original_subdir: Original
+  segmented_subdir: Segmented
+  # Canonical class order  (folder name → display name handled in class_names.json)
+  classes:
+    - Benign
+    - Early
+    - Pre-B
+    - Pro
+  val_fraction: 0.15
+  test_fraction: 0.15
+
+# ── Image ───────────────────────────────────────────────────────────────────
+image:
+  size: 224          # full training
+  smoke_test_size: 128
+  channels: 3
+
+# ── Segmentation (HSV colour thresholding for Stream A) ──────────────────────
+segmentation:
+  # Purple / blue nuclei (from Kaggle reference notebook)
+  lower_nuclei: [100, 40, 40]
+  upper_nuclei: [160, 255, 255]
+  # Pink / purple cytoplasm (from Kaggle reference notebook)
+  lower_cytoplasm: [120, 20, 100]
+  upper_cytoplasm: [170, 100, 255]
+  # Morphological cleanup
+  morph_kernel_size: 5
+  open_iterations: 1
+  close_iterations: 2
+  # Small blob removal (minimum area in pixels)
+  min_blob_area: 500
+
+# ── Normalization ───────────────────────────────────────────────────────────
+normalization:
+  use_reinhard: false
+  reference_image_path: null
+
+# ── Augmentation ────────────────────────────────────────────────────────────
+augmentation:
+  rotation_range: 0.10
+  zoom_range: 0.10
+  contrast_range: 0.10
+  horizontal_flip: true
+  vertical_flip: false
+  width_shift_range: 0.1
+  height_shift_range: 0.1
+  brightness_range: [0.85, 1.15]
+
+# ── Model ───────────────────────────────────────────────────────────────────
+model:
+  backbone: EfficientNetB0   # used by backbones.py
+  dropout_rate: 0.4
+  embedding_dim: 256         # dense layer after GAP in each stream
+  num_classes: 4
+
+# ── Training ────────────────────────────────────────────────────────────────
+training:
+  batch_size: 32
+  label_smoothing: 0.1
+  # Phase 1: Train head with backbones frozen
+  phase1_epochs: 15
+  phase1_lr: 0.001       # 1e-3
+  # Phase 2: Fine-tune top N backbone layers
+  phase2_epochs: 35
+  phase2_lr: 0.00001     # 1e-5
+  unfreeze_top_n: 30
+  # Total epochs & default lr fallback
+  epochs: 50
+  learning_rate: 0.001
+  # Smoke-test overrides (--smoke-test flag)
+  smoke_test_samples: 64
+  smoke_test_epochs: 1
+
+# ── Paths ───────────────────────────────────────────────────────────────────
+paths:
+  models_dir: models
+  model_filename: dual_stream.keras
+  class_names_file: models/class_names.json
+  reports_dir: reports
+  figures_dir: reports/figures
+  metrics_dir: reports/metrics
