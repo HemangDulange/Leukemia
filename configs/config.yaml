@@ -11,7 +11,7 @@ data:
   classes:
     - Benign
     - Early
-    - Pre-B
+    - Pre
     - Pro
   val_fraction: 0.15
   test_fraction: 0.15

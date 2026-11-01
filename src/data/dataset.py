@@ -41,15 +41,19 @@ def _load_and_preprocess_pair(
 ) -> Tuple[Tuple[tf.Tensor, tf.Tensor], tf.Tensor]:
     """Load original image, compute HSV segmentation, resize, and normalize."""
 
-    def _py_func(op_bytes: bytes, sp_bytes: bytes) -> Tuple[np.ndarray, np.ndarray]:
-        path_str = op_bytes.decode()
+    def _py_func(op_bytes, sp_bytes) -> Tuple[np.ndarray, np.ndarray]:
+        path_str = op_bytes.numpy().decode() if hasattr(op_bytes, "numpy") else op_bytes.decode()
         orig_bgr = cv2.imread(path_str, cv2.IMREAD_COLOR)
+
+        # Attempt to load pre-segmented image if provided
+        seg_path_str = sp_bytes.numpy().decode() if hasattr(sp_bytes, "numpy") else sp_bytes.decode()
+        seg_bgr = cv2.imread(seg_path_str, cv2.IMREAD_COLOR) if seg_path_str else None
 
         if orig_bgr is None:
             # Fallback zero-filled array if file read failed
             orig_bgr = np.zeros((img_size, img_size, 3), dtype=np.uint8)
             seg_bgr = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-        else:
+        elif seg_bgr is None:
             # Segment using HSV color threshold pipeline
             _, seg_bgr = segment_image(orig_bgr, cfg)
 

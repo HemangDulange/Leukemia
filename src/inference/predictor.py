@@ -67,6 +67,7 @@ class Predictor:
         display_mapping = {
             "Benign": "Hematogones",
             "Early": "Early Pre-B ALL",
+            "Pre": "Pre-B ALL",
             "Pre-B": "Pre-B ALL",
             "Pro": "Pro-B ALL",
         }
