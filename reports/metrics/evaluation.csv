@@ -1,0 +1,23 @@
+Category,Metric,Value
+Overall,Accuracy,0.9775
+Overall,Precision (Weighted),0.9777
+Overall,Recall (Weighted),0.9775
+Overall,F1 Score (Weighted),0.9774
+Overall,AUC (Macro OvR),0.9992
+Overall,AUC (Weighted OvR),0.9994
+Class: Hematogones,Precision,0.9726
+Class: Hematogones,Recall,0.9342
+Class: Hematogones,F1-Score,0.953
+Class: Hematogones,Support,76.0
+Class: Early Pre-B ALL,Precision,0.9669
+Class: Early Pre-B ALL,Recall,0.9865
+Class: Early Pre-B ALL,F1-Score,0.9766
+Class: Early Pre-B ALL,Support,148.0
+Class: Pre-B ALL,Precision,0.9728
+Class: Pre-B ALL,Recall,0.9931
+Class: Pre-B ALL,F1-Score,0.9828
+Class: Pre-B ALL,Support,144.0
+Class: Pro-B ALL,Precision,1.0
+Class: Pro-B ALL,Recall,0.9752
+Class: Pro-B ALL,F1-Score,0.9874
+Class: Pro-B ALL,Support,121.0
