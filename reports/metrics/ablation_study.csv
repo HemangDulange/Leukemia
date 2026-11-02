@@ -1,0 +1,4 @@
+Configuration,Accuracy,F1-Score,AUC,Precision,Recall
+Segmented Stream Only,0.4601,0.356,0.9109,0.7574,0.4601
+Original Stream Only,0.6585,0.638,0.9861,0.8077,0.6585
+Dual-Stream (Proposed),0.9775,0.9774,0.9992,0.9777,0.9775
