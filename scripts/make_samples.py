@@ -1,9 +1,18 @@
 """
-Select the highest-confidence correctly classified test image for each leukemia subtype.
+Select sample test images closest to the median confidence for each leukemia subtype.
 
 Evaluates every image in the test split using Predictor (with unified prepare_pair),
-computes per-class test accuracy, ranks correct predictions by confidence,
-and copies the top-1 sample per class to /kaggle/working/samples/ (and app/samples/):
+computes per-class test accuracy, filters images classified correctly,
+and chooses the image whose confidence is closest to the MEDIAN confidence
+of the correct predictions of that class (deterministic, no randomness).
+
+Prints for each class:
+  - Number of correct images
+  - Min / 10th percentile / Median / 90th percentile / Max confidence
+  - Chosen filename and its confidence
+  - Per-class test accuracy
+
+Copies the chosen original JPEGs to /kaggle/working/samples/ (and app/samples/):
   - Hematogones_sample.jpg  (Benign)
   - EarlyPreB_sample.jpg     (Early Pre-B ALL)
   - PreB_sample.jpg          (Pre-B ALL)
@@ -26,7 +35,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Import TensorFlow first to initialize native DLLs before other scientific libraries on Windows
 import tensorflow as tf
+import numpy as np
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
@@ -61,7 +72,7 @@ _SAMPLE_FILENAMES_BY_CLASS: Dict[str, str] = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Select highest-confidence correct test image per class and build samples.zip."
+        description="Select median-confidence correct test image per class and build samples.zip."
     )
     parser.add_argument(
         "--config",
@@ -115,7 +126,7 @@ def make_samples(
     output_dir: Optional[Path] = None,
     smoke_test: bool = False,
 ) -> Tuple[List[Path], Path]:
-    """Evaluate test split, pick highest-confidence correct image per class, and bundle zip.
+    """Evaluate test split, pick median-confidence correct image per class, and bundle zip.
 
     Parameters
     ----------
@@ -201,14 +212,14 @@ def make_samples(
         except Exception as err:
             logger.error("Error predicting %s: %s", src_path, err)
 
-    # 4. Report per-class accuracy, top 5 correct images, and select top-1 sample
+    # 4. Report per-class accuracy, confidence statistics, and select median-confidence sample
     selected_files: List[Path] = []
     local_app_samples = _REPO_ROOT / "app" / "samples"
     local_app_samples.mkdir(parents=True, exist_ok=True)
 
-    print("\n" + "=" * 70)
-    print("TEST SPLIT EVALUATION & SAMPLE SELECTION REPORT")
-    print("=" * 70)
+    print("\n" + "=" * 75)
+    print("TEST SPLIT EVALUATION & MEDIAN-CONFIDENCE SAMPLE SELECTION REPORT")
+    print("=" * 75)
 
     for cls_idx in range(num_classes):
         class_name = classes[cls_idx]
@@ -224,34 +235,54 @@ def make_samples(
         n_correct = len(correct_list)
         accuracy = (n_correct / total_cls) if total_cls > 0 else 0.0
 
-        # Sort correctly classified images descending by confidence (highest confidence first)
-        correct_list.sort(key=lambda x: x["confidence"], reverse=True)
+        chosen_item: Optional[Dict[str, Any]] = None
 
         print(f"\nSubtype [{cls_idx}]: {class_name} ({display_name})")
-        print(f"  Test Accuracy : {accuracy * 100:6.2f}% ({n_correct}/{total_cls})")
-        print(f"  Top 5 Correct Predictions (by confidence):")
+        print(f"  Per-class Accuracy    : {accuracy * 100:6.2f}% ({n_correct}/{total_cls})")
+        print(f"  Number of Correct     : {n_correct} images")
 
-        top_5 = correct_list[:5]
-        if top_5:
-            for rank, item in enumerate(top_5, start=1):
-                print(f"    {rank}. {item['filename']:<32} | Confidence: {item['confidence'] * 100:6.2f}%")
-        else:
-            print("    (No correctly classified images found for this class)")
+        if n_correct > 0:
+            confs = np.array([item["confidence"] for item in correct_list], dtype=np.float64)
+            min_conf = float(np.min(confs))
+            p10_conf = float(np.percentile(confs, 10))
+            med_conf = float(np.median(confs))
+            p90_conf = float(np.percentile(confs, 90))
+            max_conf = float(np.max(confs))
 
-        # Choose the one with the highest confidence for that class (no random choice)
-        chosen_item: Optional[Dict[str, Any]] = None
-        if correct_list:
-            chosen_item = correct_list[0]
-        elif all_candidates[cls_idx]:
-            # Fallback if no images were predicted correctly (e.g. untrained smoke weights)
-            sorted_all = sorted(all_candidates[cls_idx], key=lambda x: x["confidence"], reverse=True)
-            chosen_item = sorted_all[0]
-            logger.warning(
-                "No correctly classified candidate for %s; using highest-confidence candidate %s (predicted as %d)",
-                class_name,
-                chosen_item["filename"],
-                chosen_item["pred_label"],
+            print(f"  Confidence (Min)      : {min_conf * 100:6.2f}%")
+            print(f"  Confidence (10th Pct) : {p10_conf * 100:6.2f}%")
+            print(f"  Confidence (Median)   : {med_conf * 100:6.2f}%")
+            print(f"  Confidence (90th Pct) : {p90_conf * 100:6.2f}%")
+            print(f"  Confidence (Max)      : {max_conf * 100:6.2f}%")
+
+            # Choose image whose confidence is closest to MEDIAN confidence of correct predictions (deterministic)
+            chosen_item = min(
+                correct_list,
+                key=lambda item: (abs(item["confidence"] - med_conf), item["filename"]),
             )
+            print(f"  Chosen Filename       : {chosen_item['filename']}")
+            print(
+                f"  Chosen Confidence     : {chosen_item['confidence'] * 100:6.2f}% "
+                f"(closest to median {med_conf * 100:.2f}%)"
+            )
+        else:
+            print("  Confidence Statistics : N/A (0 correct predictions)")
+            if all_candidates[cls_idx]:
+                # Fallback if no images were predicted correctly (e.g. untrained smoke weights)
+                confs = np.array([item["confidence"] for item in all_candidates[cls_idx]], dtype=np.float64)
+                med_conf = float(np.median(confs))
+                chosen_item = min(
+                    all_candidates[cls_idx],
+                    key=lambda item: (abs(item["confidence"] - med_conf), item["filename"]),
+                )
+                logger.warning(
+                    "No correctly classified candidate for %s; using median-confidence candidate %s (predicted as %d)",
+                    class_name,
+                    chosen_item["filename"],
+                    chosen_item["pred_label"],
+                )
+                print(f"  Chosen Filename (Fallback): {chosen_item['filename']}")
+                print(f"  Chosen Confidence (Fallback): {chosen_item['confidence'] * 100:6.2f}%")
 
         if chosen_item is not None and chosen_item["path"].exists():
             if chosen_item["path"].resolve() != target_path.resolve():
@@ -267,10 +298,7 @@ def make_samples(
                 shutil.copy2(chosen_item["path"], mirror_path)
 
             selected_files.append(target_path)
-            print(
-                f"  Selected Sample: {chosen_item['filename']} "
-                f"({chosen_item['confidence'] * 100:.2f}%) -> {target_filename}"
-            )
+            print(f"  Target File           : {target_filename}")
         else:
             # Synthetic fallback for mock smoke tests without files
             logger.warning("Generating placeholder sample for %s -> %s", class_name, target_filename)
@@ -281,8 +309,9 @@ def make_samples(
             if dest_dir.resolve() != local_app_samples.resolve() and not mirror_path.exists():
                 synthetic_img.save(mirror_path, "JPEG")
             selected_files.append(target_path)
+            print(f"  Target File (Synthetic): {target_filename}")
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 75)
 
     # 5. Zip the 4 chosen original JPEGs as samples.zip
     zip_dest.parent.mkdir(parents=True, exist_ok=True)
