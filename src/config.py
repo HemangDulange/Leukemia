@@ -31,6 +31,8 @@ class DataConfig:
     display_names: Dict[str, str] = field(default_factory=dict)
     processed_dir: Path = field(default_factory=lambda: _REPO_ROOT / "data" / "processed")
     dedup_threshold: float = 0.995
+    drop_duplicates: bool = True
+    exclude_class_extensions: Dict[str, List[str]] = field(default_factory=dict)
     exclude_files: List[str] = field(default_factory=list)
 
 
@@ -191,6 +193,8 @@ def load_config(config_path: Path | str | None = None) -> AppConfig:
         test_fraction=data_raw["test_fraction"],
         processed_dir=_resolve_path(processed_val, root),
         dedup_threshold=float(data_raw.get("dedup_threshold", 0.995)),
+        drop_duplicates=bool(data_raw.get("drop_duplicates", True)),
+        exclude_class_extensions=dict(data_raw.get("exclude_class_extensions", {})),
         exclude_files=list(data_raw.get("exclude_files", [])),
     )
 

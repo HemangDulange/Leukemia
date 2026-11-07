@@ -54,7 +54,7 @@ Original Smear Image (224 × 224 × 3)
 
 ---
 
-## 🎯 Target Classes & Dataset
+## 🎯 Target Classes & Dataset Audit Findings
 
 The classifier operates on the **Multi-Class Leukemia Dataset (ALL Subtypes, AML, Normal)**:
 - **Kaggle Path**: `/kaggle/input/datasets/shimantokumar/multi-class-leukemia-dataset-all-subtypesamlnormal/leukemia_datasets`
@@ -64,7 +64,12 @@ The classifier operates on the **Multi-Class Leukemia Dataset (ALL Subtypes, AML
   - `Normal`: 2,000 images
   - `PreB`: 1,800 images
   - `ProB`: 1,559 images
-- **Mixed Formats & Resolutions**: `.jpg`, `.bmp`, `.tiff`, `.png` ranging from $400 \times 400$ up to $2560 \times 1920$.
+
+### Critical Dataset Audit Findings
+1. **Pervasive Near-Duplicates**: ~3,100 of the 9,097 images are duplicates (the same photo exists twice, once at $224 \times 224$ and once at $1024 \times 768$). Only ~6,000 distinct biological photos exist.
+2. **PreB Domain Contamination**: 16 `.bmp` files inside the `PreB` folder are single dark cells on black backgrounds from a different source than the other PreB smear images.
+3. **Format & Illumination Shortcuts**: AML consists of 2,000 close-up TIFFs ($400 \times 400$); ~1,000 Normal images are black-background single-cell BMPs ($450 \times 450$); all other images are wide-field smear JPGs.
+4. **Stain Color Shortcut**: A Random Forest trained on **only mean R, G, B and black-pixel share** reaches **97% test accuracy**, proving that models without color robustness rely heavily on stain coloration rather than true cellular morphology.
 
 Canonical class mapping is configured via `configs/config.yaml` and persisted to `models/class_names.json`:
 
@@ -80,19 +85,25 @@ Canonical class mapping is configured via `configs/config.yaml` and persisted to
 
 ## 🔍 Near-Duplicate-Aware Pearson Correlation Splits
 
-To guarantee absolute split independence and prevent data leakage:
-1. **Pearson Correlation Near-Duplicate Detection**:
-   - Generates $64 \times 64$ RGB thumbnails with PIL draft mode for JPEGs using an 8-worker `ThreadPoolExecutor`.
-   - Thumbnails are cached to `data/processed/thumbs64.npy` for instant reloading.
+To guarantee absolute split independence, eliminate duplicate contamination, and prevent data leakage:
+1. **Extension-Level Filtering (`data.exclude_class_extensions`)**:
+   - Skips files matching specified extensions per class (e.g., `{PreB: [".bmp"]}`), eliminating the 16 non-smear black-background BMPs from PreB.
+2. **Pearson Correlation Near-Duplicate Detection**:
+   - Generates $64 \times 64$ RGB thumbnails with PIL draft mode for JPEGs using an 8-worker `ThreadPoolExecutor`, simultaneously recording original dimensions `(w, h)`.
+   - Caches thumbnails and sizes to `data/processed/thumbs64.npz` for instant reloading.
    - Converted to $32 \times 32$ grayscale (block averaging), zero-mean centered, and L2-normalized.
-   - Evaluated across all 8 D4 dihedral symmetries (4 rotations $\times$ horizontal flip) using chunked matrix multiplication ($500 \times 500$ blocks).
-   - Images with maximum Pearson correlation $\ge \text{dedup\_threshold}$ (default `0.995`) form near-duplicate pairs and are grouped via `scipy.sparse.csgraph.connected_components`.
-   - **Cluster Safety Threshold**: Any group with $> 25$ images is dissolved into singletons with a logged warning, preventing false-positive clustering on plain dark/blank background images.
-2. **Stratified Group Splitting (`StratifiedGroupKFold`)**:
+   - Evaluated across all 8 D4 dihedral symmetries (4 rotations $\times$ horizontal flip) using chunked matrix multiplication ($500 \times 500$ blocks). Pairs with correlation $\ge \text{dedup\_threshold}$ (default `0.995`) form near-duplicate edges clustered with `scipy.sparse.csgraph.connected_components`.
+3. **Safety Clustering Guards**:
+   - **Cross-Class Duplicate Drop**: If a group contains images from more than one class, all of its members are dropped and logged to eliminate ambiguous data.
+   - **Cluster Size Safety**: Groups with $> 25$ images are treated as independent singletons with a logged warning, preventing false clustering on uniform dark backgrounds.
+4. **Resolution-Aware Deduplication (`data.drop_duplicates: true`)**:
+   - Keeps exactly one image per group: the one with the largest original resolution (`width * height`). Ties are deterministically broken alphabetically by path.
+   - Dropped duplicate records are exported to `data/splits/dropped_duplicates.csv`.
+5. **Stratified Group Splitting (`StratifiedGroupKFold`)**:
    - 7 folds are evaluated with fixed seed 42 (Fold 0 = Test ~15%, Fold 1 = Validation ~15%, Folds 2–6 = Train ~70%).
    - All near-duplicates belonging to the same group land strictly in the same split.
-3. **Exclusion List (`data.exclude_files`)**:
-   - Optional config key `data.exclude_files` (list of relative paths) skipped during dataset image discovery.
+6. **Dedicated CLI Script (`scripts/prepare_splits.py`)**:
+   - Run `python scripts/prepare_splits.py [--force]` to discover images, deduplicate, and generate reproducible `train.csv`, `val.csv`, `test.csv`, and `dropped_duplicates.csv`. (Reused directly by `train.py`).
 
 ---
 
@@ -181,19 +192,22 @@ Full training requires GPU compute:
    `/kaggle/input/datasets/shimantokumar/multi-class-leukemia-dataset-all-subtypesamlnormal/leukemia_datasets`
 3. Execute the CLI pipeline:
    ```bash
-   # 1. Discover images and generate duplicate-aware stratified splits:
-   python scripts/prepare_data.py --force
+   # 1. Discover images, deduplicate near-duplicates, and generate stratified splits:
+   python scripts/prepare_splits.py --force
 
    # 2. Visual verification grid of segmentation masks:
    python scripts/preview_masks.py
 
-   # 3. Two-phase training:
+   # 3. Two-phase training (Phase 1 head -> Phase 2 fine-tuning):
    python scripts/train.py
 
-   # 4. Evaluation and publication metrics:
-   python scripts/evaluate.py --ablation
+   # 4. Evaluation (normal test, grayscale robustness, smear vs non-smear subgroups, and ablation):
+   python scripts/evaluate.py --gray-test --subgroups --ablation
 
-   # 5. Extract representative sample images closest to median confidence:
+   # 5. Color-only baseline evaluation:
+   python scripts/colour_baseline.py
+
+   # 6. Extract representative sample images closest to median confidence:
    python scripts/make_samples.py
    ```
 
@@ -207,19 +221,19 @@ leukemia-all-classifier/
 │   └── config.yaml             # Single source of truth (classes, display names, hyperparameters)
 ├── data/
 │   ├── processed/              # Lossless precomputed PNGs (orig/ and seg/)
-│   └── splits/                 # train.csv, val.csv, test.csv
+│   └── splits/                 # train.csv, val.csv, test.csv, dropped_duplicates.csv
 ├── models/
 │   ├── class_names.json        # Canonical 5-class ordering & display names
 │   └── dual_stream.keras       # Trained dual-stream model weights
 ├── src/
 │   ├── config.py               # Typed AppConfig loader with dynamic num_classes
 │   ├── data/
-│   │   ├── splits.py           # Perceptual hash near-duplicate grouping & StratifiedGroupKFold
+│   │   ├── splits.py           # Pearson correlation near-duplicate grouping & StratifiedGroupKFold
 │   │   └── dataset.py          # Dual-input tf.data pipeline reading processed cache
 │   ├── preprocessing/
 │   │   ├── pair.py             # Single unified prepare_pair function (train & serve)
 │   │   ├── segmentation.py     # BGR->HSV thresholding & morphological filtering
-│   │   └── augmentation.py     # Joint spatial Keras augmentation layers (train-only)
+│   │   └── augmentation.py     # Joint spatial & color robustness augmentation (train-only)
 │   ├── models/
 │   │   ├── backbones.py        # EfficientNet backbone factory
 │   │   └── dual_stream.py      # Dual-stream functional model & Phase 2 unfreezing
@@ -234,19 +248,20 @@ leukemia-all-classifier/
 │       ├── model_loader.py     # Local model loader with Hugging Face Hub download fallback
 │       └── predictor.py        # Production inference engine used by Streamlit
 ├── scripts/
-│   ├── prepare_data.py         # Discover images and generate reproducible splits
+│   ├── prepare_splits.py       # Discover images, deduplicate, and generate reproducible splits
+│   ├── prepare_data.py         # Backward-compatible wrapper for prepare_splits
 │   ├── precompute_segmented.py # Precompute unified PNG pairs
 │   ├── preview_masks.py        # 30-image mask preview grid across all 5 classes
 │   ├── colour_baseline.py      # Random Forest color-only baseline (mean RGB + black share)
 │   ├── train.py                # Train model (calls precompute automatically)
-│   ├── evaluate.py             # Evaluate test split performance (--gray-test, --ablation)
+│   ├── evaluate.py             # Evaluate test split performance (--gray-test, --subgroups, --ablation)
 │   ├── check_serving_skew.py   # Verify live Predictor vs offline pipeline parity
 │   └── make_samples.py         # Pick median-confidence samples per class & bundle zip
 ├── app/
 │   └── streamlit_app.py        # Interactive Streamlit application
 ├── reports/
 │   ├── figures/                # High-res diagnostic figures (mask_preview.png, confusion_matrix.png)
-│   └── metrics/                # evaluation.csv, history.json, ablation_study.csv
+│   └── metrics/                # evaluation.csv, history.json, subgroups.csv, colour_baseline.csv
 ├── tests/
 │   ├── make_fake_dataset.py    # Synthetic 5-class dataset generator for smoke testing
 │   └── test_data.py            # Unit tests for perceptual hash and data pipelines

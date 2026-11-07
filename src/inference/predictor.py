@@ -121,10 +121,16 @@ class Predictor:
             raise TypeError(f"Unsupported image type: {type(image)}")
 
         # 2. Shared preprocessing via prepare_pair (eliminates train/serve skew)
+        target_size = self._cfg.image.size
+        if hasattr(self._model, "input_shape") and isinstance(self._model.input_shape, list) and self._model.input_shape[0]:
+            h = self._model.input_shape[0][1]
+            if h is not None and h > 0:
+                target_size = int(h)
+
         orig_arr, seg_arr, mask_arr = prepare_pair(
             pil_image,
             cfg=self._cfg,
-            target_size=self._cfg.image.size,
+            target_size=target_size,
             return_mask=True,
         )
 

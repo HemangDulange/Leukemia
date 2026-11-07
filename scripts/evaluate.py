@@ -161,6 +161,77 @@ def run_ablation_study(
     return ablation_df
 
 
+def run_subgroups_evaluation(
+    test_df: pd.DataFrame,
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+    display_names: List[str],
+    cfg: AppConfig,
+) -> pd.DataFrame:
+    """Evaluate accuracy and per-class recall across smear vs non-smear subgroups.
+
+    Subgroups:
+    (i) Whole test set
+    (ii) Only smear images (.jpg files)
+    (iii) Only non-smear images (AML .tiff and Normal .bmp)
+    """
+    y_pred = np.argmax(y_pred_proba, axis=1)
+    paths = test_df["original_path"].astype(str).str.lower()
+
+    # Define subgroup boolean masks
+    is_smear = paths.str.endswith((".jpg", ".jpeg"))
+    is_nonsmear = paths.str.endswith((".tif", ".tiff", ".bmp"))
+
+    subgroup_defs = [
+        ("Whole Test Set", np.ones(len(test_df), dtype=bool)),
+        ("Smear Images (.jpg)", is_smear.values),
+        ("Non-Smear Images (AML .tiff & Normal .bmp)", is_nonsmear.values),
+    ]
+
+    rows = []
+    print("\n" + "=" * 80)
+    print("SUBGROUP PERFORMANCE EVALUATION (--subgroups)")
+    print("=" * 80)
+
+    for label, mask in subgroup_defs:
+        count = int(np.sum(mask))
+        if count == 0:
+            row = {"subgroup": label, "image_count": 0, "accuracy": None}
+            for name in display_names:
+                row[f"{name}_recall"] = None
+            rows.append(row)
+            continue
+
+        sub_true = y_true[mask]
+        sub_pred = y_pred[mask]
+        acc = float(np.mean(sub_true == sub_pred))
+
+        row = {"subgroup": label, "image_count": count, "accuracy": round(acc, 4)}
+
+        # Per-class recall
+        for idx, name in enumerate(display_names):
+            cls_mask = sub_true == idx
+            if np.sum(cls_mask) > 0:
+                rec = float(np.mean(sub_pred[cls_mask] == idx))
+                row[f"{name}_recall"] = round(rec, 4)
+            else:
+                row[f"{name}_recall"] = None
+
+        rows.append(row)
+
+    subgroups_df = pd.DataFrame(rows)
+
+    print(subgroups_df.to_string(index=False))
+    print("=" * 80 + "\n")
+
+    csv_path = cfg.paths.metrics_dir / "subgroups.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    subgroups_df.to_csv(csv_path, index=False)
+    logger.info("Saved subgroup metrics -> %s", csv_path)
+
+    return subgroups_df
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate the dual-stream model on the test split."
@@ -180,6 +251,11 @@ def parse_args() -> argparse.Namespace:
         "--gray-test",
         action="store_true",
         help="Evaluate test split with both streams converted to grayscale (repeated to 3 channels)",
+    )
+    parser.add_argument(
+        "--subgroups",
+        action="store_true",
+        help="Evaluate accuracy and per-class recall on whole test set, smear images (.jpg), and non-smear images",
     )
     return parser.parse_args()
 
@@ -320,7 +396,11 @@ def main() -> None:
             print(f"{name + ' Recall':<25} | {norm_rec:16.2f}% | {gray_rec:16.2f}%")
         print("=" * 70 + "\n")
 
-    # 9. Optional Ablation Study
+    # 9. Optional Subgroups Evaluation (--subgroups)
+    if args.subgroups:
+        run_subgroups_evaluation(test_df, y_true, y_pred_proba, display_names, cfg)
+
+    # 10. Optional Ablation Study
     if args.ablation:
         run_ablation_study(model, test_ds, display_names, cfg)
 

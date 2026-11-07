@@ -67,6 +67,79 @@ class TestNearDuplicateGrouping(unittest.TestCase):
         self.assertEqual(images_in_groups, 0)
         self.assertEqual(largest_group, 1)
 
+    def test_drop_duplicates_keeps_largest_area_image(self):
+        """Verify process_and_deduplicate retains the higher-resolution image in a near-duplicate pair."""
+        from src.data.splits import process_and_deduplicate
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            raw_dir = Path(tmp_dir) / "raw"
+            processed_dir = Path(tmp_dir) / "processed"
+            splits_dir = Path(tmp_dir) / "splits"
+            cls_dir = raw_dir / "AML"
+            cls_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create an original image and save at two sizes (1024x768 vs 224x224)
+            rng = np.random.RandomState(42)
+            base_pattern = np.zeros((768, 1024, 3), dtype=np.uint8)
+            base_pattern[200:400, 300:600] = [180, 70, 210]
+            img_large = Image.fromarray(base_pattern)
+            img_small = img_large.resize((224, 224), Image.Resampling.BILINEAR)
+
+            img_large.save(cls_dir / "large_photo.jpg", "JPEG")
+            img_small.save(cls_dir / "small_photo.jpg", "JPEG")
+
+            cfg = load_config()
+            cfg.data.raw_dir = raw_dir
+            cfg.data.processed_dir = processed_dir
+            cfg.data.splits_dir = splits_dir
+            cfg.data.classes = ["AML"]
+            cfg.data.drop_duplicates = True
+            cfg.data.dedup_threshold = 0.995
+
+            df = process_and_deduplicate(cfg)
+
+            # Exactly one image should remain: the large one
+            self.assertEqual(len(df), 1)
+            self.assertEqual(df.iloc[0]["filename"], "large_photo.jpg")
+
+            # dropped_duplicates.csv should contain small_photo.jpg
+            dropped_csv = splits_dir / "dropped_duplicates.csv"
+            self.assertTrue(dropped_csv.exists())
+            dropped_df = pd.read_csv(dropped_csv)
+            self.assertEqual(len(dropped_df), 1)
+            self.assertEqual(dropped_df.iloc[0]["filename"], "small_photo.jpg")
+            self.assertIn("large_photo.jpg", dropped_df.iloc[0]["kept_path"])
+
+    def test_cross_class_duplicates_are_dropped(self):
+        """Verify cross-class duplicates have all members dropped from dataset."""
+        from src.data.splits import process_and_deduplicate
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            raw_dir = Path(tmp_dir) / "raw"
+            processed_dir = Path(tmp_dir) / "processed"
+            splits_dir = Path(tmp_dir) / "splits"
+            (raw_dir / "AML").mkdir(parents=True, exist_ok=True)
+            (raw_dir / "Normal").mkdir(parents=True, exist_ok=True)
+
+            # Save the exact same image into both AML and Normal
+            pattern = np.zeros((100, 100, 3), dtype=np.uint8)
+            pattern[20:60, 20:60] = [200, 100, 150]
+            Image.fromarray(pattern).save(raw_dir / "AML" / "shared_cell.jpg")
+            Image.fromarray(pattern).save(raw_dir / "Normal" / "shared_cell.jpg")
+
+            cfg = load_config()
+            cfg.data.raw_dir = raw_dir
+            cfg.data.processed_dir = processed_dir
+            cfg.data.splits_dir = splits_dir
+            cfg.data.classes = ["AML", "Normal"]
+            cfg.data.drop_duplicates = True
+            cfg.data.dedup_threshold = 0.995
+
+            df = process_and_deduplicate(cfg)
+
+            # Both members should be dropped due to ambiguous cross-class label
+            self.assertEqual(len(df), 0)
+
 
 class TestExcludeFilesFiltering(unittest.TestCase):
     def test_discover_dataset_images_skips_excluded(self):
@@ -95,6 +168,37 @@ class TestExcludeFilesFiltering(unittest.TestCase):
             self.assertNotIn("skip_me.jpg", discovered_paths)
             self.assertNotIn("skip_me_too.png", discovered_paths)
             self.assertEqual(len(discovered_paths), 1)
+
+
+    def test_discover_dataset_images_skips_excluded_class_extensions(self):
+        """Verify discover_dataset_images skips files matching exclude_class_extensions per class."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            raw_dir = Path(tmp_dir)
+            preb_dir = raw_dir / "PreB"
+            aml_dir = raw_dir / "AML"
+            preb_dir.mkdir(parents=True, exist_ok=True)
+            aml_dir.mkdir(parents=True, exist_ok=True)
+
+            # PreB files: one .jpg (keep) and one .bmp (skip per audit finding)
+            Image.new("RGB", (64, 64), color=(100, 100, 100)).save(preb_dir / "smear.jpg")
+            Image.new("RGB", (64, 64), color=(10, 10, 10)).save(preb_dir / "dark_cell.bmp")
+
+            # AML file: one .bmp (keep, because exclusion is PreB-only)
+            Image.new("RGB", (64, 64), color=(120, 120, 120)).save(aml_dir / "cell.bmp")
+
+            cfg = load_config()
+            cfg.data.raw_dir = raw_dir
+            cfg.data.classes = ["AML", "PreB"]
+            cfg.data.exclude_class_extensions = {"PreB": [".bmp"]}
+            cfg.data.exclude_files = []
+
+            df = discover_dataset_images(cfg)
+            discovered = [Path(p).name for p in df["original_path"]]
+
+            self.assertIn("smear.jpg", discovered)
+            self.assertNotIn("dark_cell.bmp", discovered)
+            self.assertIn("cell.bmp", discovered)
+            self.assertEqual(len(discovered), 2)
 
 
 class TestClassWeightsAndDistribution(unittest.TestCase):

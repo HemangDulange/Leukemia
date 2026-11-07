@@ -207,12 +207,9 @@ def run_training(
             cfg.paths.figures_dir / "training_history.png",
         )
 
-    # 5. Save model if not smoke test
-    if not smoke_test:
-        best_model_path.parent.mkdir(parents=True, exist_ok=True)
-        model.save(str(best_model_path))
-        logger.info("Final model saved -> %s", best_model_path)
-    else:
-        logger.info("[smoke-test] Training completed successfully. Model not saved.")
+    # 5. Save model
+    best_model_path.parent.mkdir(parents=True, exist_ok=True)
+    model.save(str(best_model_path))
+    logger.info("Final model saved -> %s", best_model_path)
 
     return model

@@ -1,12 +1,11 @@
 """
 Generate synthetic 5-class leukemia dataset for local smoke-testing.
 
-Creates 5 class folders with 12 images each (total 60 images):
-  - Classes: AML, Early_PreB, Normal, PreB, ProB
-  - Mixed formats: .jpg, .bmp, .tiff, .png
-  - Mixed dimensions: 400x400, 640x480, 1024x768, up to 2560x1920
-  - Includes near-duplicate images (e.g. rotated/flipped) to test canonical perceptual hash grouping
-  - Includes purple/blue nuclei and pink cytoplasm to test HSV segmentation
+Audit findings reflected in generator:
+- Near-duplicates: each class includes the same photo saved at two sizes (1024x768 and 224x224)
+  plus a horizontally flipped copy.
+- PreB contains one non-smear dark-cell .bmp file to verify exclude_class_extensions filtering.
+- AML includes TIFF files, Normal includes single-cell BMP files, and others are smear JPEGs.
 """
 from __future__ import annotations
 
@@ -31,7 +30,7 @@ SIZES = [
     (1024, 768),
     (1280, 960),
     (1920, 1080),
-    (2560, 1920),  # large scan test
+    (2560, 1920),
 ]
 
 FORMAT_EXTS = [
@@ -44,7 +43,6 @@ FORMAT_EXTS = [
 
 def draw_synthetic_cell(width: int, height: int, rng: np.random.RandomState) -> Image.Image:
     """Create a synthetic blood smear patch with background, cytoplasm, and nucleus."""
-    # Light background (smear slide)
     bg_color = (
         int(rng.randint(220, 245)),
         int(rng.randint(215, 240)),
@@ -53,20 +51,17 @@ def draw_synthetic_cell(width: int, height: int, rng: np.random.RandomState) -> 
     img = Image.new("RGB", (width, height), color=bg_color)
     draw = ImageDraw.Draw(img)
 
-    # Random position and radii for distinct perceptual hashes across cells
     cx = int(width * rng.uniform(0.3, 0.7))
     cy = int(height * rng.uniform(0.3, 0.7))
     r_cyto_x = int(min(width, height) * rng.uniform(0.18, 0.35))
     r_cyto_y = int(min(width, height) * rng.uniform(0.18, 0.35))
 
-    # Cytoplasm (pink/purple)
     cyto_box = [cx - r_cyto_x, cy - r_cyto_y, cx + r_cyto_x, cy + r_cyto_y]
     draw.ellipse(
         cyto_box,
         fill=(rng.randint(180, 220), rng.randint(130, 170), rng.randint(190, 230)),
     )
 
-    # Nucleus (dark purple/blue)
     r_nuc_x = int(r_cyto_x * rng.uniform(0.5, 0.8))
     r_nuc_y = int(r_cyto_y * rng.uniform(0.5, 0.8))
     nuc_box = [cx - r_nuc_x, cy - r_nuc_y, cx + r_nuc_x, cy + r_nuc_y]
@@ -75,14 +70,15 @@ def draw_synthetic_cell(width: int, height: int, rng: np.random.RandomState) -> 
         fill=(rng.randint(80, 120), rng.randint(40, 80), rng.randint(130, 180)),
     )
 
-    # Add random cellular chromatin / granule blobs
     for _ in range(rng.randint(3, 8)):
         gx = cx + int(rng.uniform(-r_nuc_x * 0.7, r_nuc_x * 0.7))
         gy = cy + int(rng.uniform(-r_nuc_y * 0.7, r_nuc_y * 0.7))
         gr = int(min(width, height) * rng.uniform(0.01, 0.04))
-        draw.ellipse([gx - gr, gy - gr, gx + gr, gy + gr], fill=(rng.randint(40, 70), rng.randint(20, 50), rng.randint(80, 120)))
+        draw.ellipse(
+            [gx - gr, gy - gr, gx + gr, gy + gr],
+            fill=(rng.randint(40, 70), rng.randint(20, 50), rng.randint(80, 120)),
+        )
 
-    # Add a few erythrocyte-like circles in background
     for _ in range(rng.randint(2, 6)):
         ex = rng.randint(0, width)
         ey = rng.randint(0, height)
@@ -94,13 +90,17 @@ def draw_synthetic_cell(width: int, height: int, rng: np.random.RandomState) -> 
 
 def create_fake_dataset(
     output_dir: Path,
-    images_per_class: int = 12,
+    images_per_class: int = 14,
     test_large_cluster: bool = False,
 ) -> None:
     """Generate fake dataset for testing.
 
-    If test_large_cluster is True, creates 28 near-duplicate images in the AML class
-    to test the > 25 member safety threshold in near-duplicate grouping.
+    Each class contains:
+    - Base image at 1024x768 (index 0)
+    - Near-duplicate at 224x224 (index 1)
+    - Near-duplicate flipped copy (index 2)
+    - PreB additionally contains one non-smear .bmp file (index 3)
+    - Other images have mixed formats matching audit findings.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.RandomState(42)
@@ -116,29 +116,58 @@ def create_fake_dataset(
         base_img: Image.Image | None = None
 
         for idx in range(n_images):
+            # Default format and dimensions
             width, height = SIZES[idx % len(SIZES)]
-            fmt, ext = FORMAT_EXTS[idx % len(FORMAT_EXTS)]
+            fmt, ext = ("JPEG", ".jpg")
+
+            if class_name == "AML" and idx > 2:
+                fmt, ext = ("TIFF", ".tiff")
+                width, height = (400, 400)
+            elif class_name == "Normal" and idx > 2 and (idx % 2 == 0):
+                fmt, ext = ("BMP", ".bmp")
+                width, height = (450, 450)
+            elif class_name == "PreB" and idx == 3:
+                # PreB non-smear .bmp from different source
+                fmt, ext = ("BMP", ".bmp")
+                width, height = (450, 450)
+
             filename = f"sample_{class_name}_{idx:03d}{ext}"
             file_path = class_folder / filename
 
-            # Make image 0 a base image, and subsequent images rotated/flipped duplicates
             if idx == 0:
+                # Base image at high resolution (1024x768)
+                width, height = (1024, 768)
+                fmt, ext = ("JPEG", ".jpg")
+                filename = f"sample_{class_name}_{idx:03d}{ext}"
+                file_path = class_folder / filename
                 img = draw_synthetic_cell(width, height, rng)
                 base_img = img
+            elif idx == 1 and base_img is not None:
+                # Near-duplicate: same image downsampled to 224x224
+                width, height = (224, 224)
+                fmt, ext = ("JPEG", ".jpg")
+                filename = f"sample_{class_name}_{idx:03d}{ext}"
+                file_path = class_folder / filename
+                img = base_img.resize((width, height), Image.Resampling.BILINEAR)
+            elif idx == 2 and base_img is not None:
+                # Near-duplicate: horizontal flip of base image
+                width, height = base_img.size
+                fmt, ext = ("JPEG", ".jpg")
+                filename = f"sample_{class_name}_{idx:03d}{ext}"
+                file_path = class_folder / filename
+                img = base_img.transpose(Image.FLIP_LEFT_RIGHT)
             elif test_large_cluster and class_name == "AML" and base_img is not None:
-                # Rotated or slightly transformed duplicates to form a large cluster
                 rot_deg = (idx * 90) % 360
                 img = base_img.rotate(rot_deg, expand=True)
-            elif idx == 1 and base_img is not None:
-                # Rotated duplicate
-                img = base_img.rotate(90, expand=True)
-            elif idx == 2 and base_img is not None:
-                # Flipped duplicate
-                img = base_img.transpose(Image.FLIP_LEFT_RIGHT)
+            elif class_name == "PreB" and idx == 3:
+                # Single dark cell on black background (.bmp)
+                img = Image.new("RGB", (width, height), color=(10, 10, 10))
+                draw = ImageDraw.Draw(img)
+                cx, cy = width // 2, height // 2
+                draw.ellipse([cx - 40, cy - 40, cx + 40, cy + 40], fill=(45, 25, 70))
             else:
                 img = draw_synthetic_cell(width, height, rng)
 
-            # Save with appropriate format
             if fmt == "JPEG":
                 img.save(file_path, "JPEG", quality=90)
             elif fmt == "BMP":
@@ -166,8 +195,8 @@ def main() -> None:
     parser.add_argument(
         "--images-per-class",
         type=int,
-        default=12,
-        help="Number of images per class (default: 12)",
+        default=14,
+        help="Number of images per class (default: 14)",
     )
     parser.add_argument(
         "--test-large-cluster",
