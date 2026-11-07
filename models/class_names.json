@@ -1,26 +1,30 @@
 {
   "class_order": [
-    "Benign",
-    "Early",
-    "Pre",
-    "Pro"
+    "AML",
+    "Early_PreB",
+    "Normal",
+    "PreB",
+    "ProB"
   ],
   "display_names": {
-    "Benign": "Hematogones",
-    "Early": "Early Pre-B ALL",
-    "Pre": "Pre-B ALL",
-    "Pro": "Pro-B ALL"
+    "AML": "AML (Myeloid)",
+    "Early_PreB": "Early Pre-B ALL",
+    "Normal": "Normal",
+    "PreB": "Pre-B ALL",
+    "ProB": "Pro-B ALL"
   },
   "index_to_folder": {
-    "0": "Benign",
-    "1": "Early",
-    "2": "Pre",
-    "3": "Pro"
+    "0": "AML",
+    "1": "Early_PreB",
+    "2": "Normal",
+    "3": "PreB",
+    "4": "ProB"
   },
   "index_to_display": {
-    "0": "Hematogones",
+    "0": "AML (Myeloid)",
     "1": "Early Pre-B ALL",
-    "2": "Pre-B ALL",
-    "3": "Pro-B ALL"
+    "2": "Normal",
+    "3": "Pre-B ALL",
+    "4": "Pro-B ALL"
   }
 }

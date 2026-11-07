@@ -12,18 +12,21 @@ Prints for each class:
   - Chosen filename and its confidence
   - Per-class test accuracy
 
-Copies the chosen original JPEGs to /kaggle/working/samples/ (and app/samples/):
-  - Hematogones_sample.jpg  (Benign)
-  - EarlyPreB_sample.jpg     (Early Pre-B ALL)
-  - PreB_sample.jpg          (Pre-B ALL)
-  - ProB_sample.jpg          (Pro-B ALL)
+Copies the chosen original images to /kaggle/working/samples/ (and app/samples/):
+  - AML_sample.jpg
+  - EarlyPreBALL_sample.jpg
+  - Normal_sample.jpg
+  - PreBALL_sample.jpg
+  - ProBALL_sample.jpg
 
-Finally, packages the 4 sample images into /kaggle/working/samples.zip.
+Finally, packages the 5 sample images into /kaggle/working/samples.zip.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import re
 import shutil
 import sys
 import zipfile
@@ -43,7 +46,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from src.config import AppConfig, load_config
-from src.data.splits import make_splits
+from src.data.splits import load_rgb_image, make_splits
 from src.inference.predictor import Predictor
 
 logging.basicConfig(
@@ -53,21 +56,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Canonical filename mapping for each class index and class folder name
-_SAMPLE_FILENAMES_BY_INDEX: Dict[int, str] = {
-    0: "Hematogones_sample.jpg",
-    1: "EarlyPreB_sample.jpg",
-    2: "PreB_sample.jpg",
-    3: "ProB_sample.jpg",
-}
 
-_SAMPLE_FILENAMES_BY_CLASS: Dict[str, str] = {
-    "Benign": "Hematogones_sample.jpg",
-    "Early": "EarlyPreB_sample.jpg",
-    "Pre": "PreB_sample.jpg",
-    "Pre-B": "PreB_sample.jpg",
-    "Pro": "ProB_sample.jpg",
-}
+def clean_display_name_to_filename(display_name: str) -> str:
+    """Format display name to clean sample filename like <CleanDisplayName>_sample.jpg."""
+    clean = re.sub(r"\(.*?\)", "", display_name).strip()
+    clean = re.sub(r"[^A-Za-z0-9]", "", clean)
+    return f"{clean}_sample.jpg"
 
 
 def parse_args() -> argparse.Namespace:
@@ -167,18 +161,26 @@ def make_samples(
     n_images = len(test_df)
     logger.info("Evaluating %d test images with Predictor...", n_images)
 
-    # 2. Instantiate Predictor
+    # 2. Instantiate Predictor and load class metadata
     predictor = Predictor(cfg=cfg, model_path=model_path)
-    classes = cfg.data.classes
-    display_mapping = getattr(predictor, "_display_mapping", {
-        "Benign": "Hematogones",
-        "Early": "Early Pre-B ALL",
-        "Pre": "Pre-B ALL",
-        "Pre-B": "Pre-B ALL",
-        "Pro": "Pro-B ALL",
-    })
+    class_meta_file = cfg.paths.class_names_file
+    if class_meta_file.exists():
+        with class_meta_file.open("r", encoding="utf-8") as fh:
+            class_meta = json.load(fh)
+    else:
+        classes = cfg.data.classes
+        disp = cfg.data.display_names or {c: c for c in classes}
+        class_meta = {
+            "class_order": classes,
+            "display_names": {c: disp.get(c, c) for c in classes},
+            "index_to_folder": {str(i): c for i, c in enumerate(classes)},
+            "index_to_display": {str(i): disp.get(c, c) for i, c in enumerate(classes)},
+        }
 
+    classes = class_meta["class_order"]
     num_classes = len(classes)
+    display_mapping = class_meta["display_names"]
+
     correct_candidates: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(num_classes)}
     all_candidates: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(num_classes)}
     total_counts: Dict[int, int] = {i: 0 for i in range(num_classes)}
@@ -194,7 +196,7 @@ def make_samples(
             continue
 
         try:
-            pil_img = Image.open(src_path).convert("RGB")
+            pil_img = load_rgb_image(src_path)
             pred = predictor.predict(pil_img, generate_gradcam=False)
             pred_label = int(pred["label_index"])
             confidence = float(pred["confidence"])
@@ -224,10 +226,7 @@ def make_samples(
     for cls_idx in range(num_classes):
         class_name = classes[cls_idx]
         display_name = display_mapping.get(class_name, class_name)
-        target_filename = _SAMPLE_FILENAMES_BY_INDEX.get(
-            cls_idx,
-            _SAMPLE_FILENAMES_BY_CLASS.get(class_name, f"{class_name}_sample.jpg"),
-        )
+        target_filename = clean_display_name_to_filename(display_name)
         target_path = dest_dir / target_filename
 
         total_cls = total_counts[cls_idx]
@@ -285,17 +284,17 @@ def make_samples(
                 print(f"  Chosen Confidence (Fallback): {chosen_item['confidence'] * 100:6.2f}%")
 
         if chosen_item is not None and chosen_item["path"].exists():
-            if chosen_item["path"].resolve() != target_path.resolve():
-                shutil.copy2(chosen_item["path"], target_path)
+            # Open and save as JPEG to guarantee valid JPEG format
+            src_img = load_rgb_image(chosen_item["path"])
+            src_img.save(target_path, "JPEG", quality=95)
 
             # Also mirror to app/samples when running full generation on Kaggle
             mirror_path = local_app_samples / target_filename
             if (
                 not smoke_test
                 and dest_dir.resolve() != local_app_samples.resolve()
-                and chosen_item["path"].resolve() != mirror_path.resolve()
             ):
-                shutil.copy2(chosen_item["path"], mirror_path)
+                src_img.save(mirror_path, "JPEG", quality=95)
 
             selected_files.append(target_path)
             print(f"  Target File           : {target_filename}")
@@ -313,7 +312,7 @@ def make_samples(
 
     print("\n" + "=" * 75)
 
-    # 5. Zip the 4 chosen original JPEGs as samples.zip
+    # 5. Zip the 5 chosen original JPEGs as samples.zip
     zip_dest.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_dest, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for f in selected_files:

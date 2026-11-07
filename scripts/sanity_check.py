@@ -167,12 +167,10 @@ def detect_pipeline_differences(
 def create_fallback_mock_split(cfg: AppConfig, n_samples: int = 16) -> pd.DataFrame:
     """Create a minimal fallback DataFrame pointing to sample images if raw data is absent."""
     sample_dir = _REPO_ROOT / "app" / "samples"
-    sample_orig = sample_dir / "Hematogones_sample.jpg"
-
-    if not sample_orig.exists():
-        # Fallback to any file in app/samples
-        existing_samples = list(sample_dir.glob("*.jpg")) + list(sample_dir.glob("*.png"))
-        sample_orig = existing_samples[0] if existing_samples else Path("sample_orig.jpg")
+    existing_samples = list(sample_dir.glob("*.jpg")) + list(sample_dir.glob("*.png"))
+    if not existing_samples and (_REPO_ROOT / "data" / "fake_raw").exists():
+        existing_samples = list((_REPO_ROOT / "data" / "fake_raw").rglob("*.jpg"))
+    sample_orig = existing_samples[0] if existing_samples else Path("sample_orig.jpg")
 
     rows = []
     classes = cfg.data.classes

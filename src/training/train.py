@@ -44,13 +44,7 @@ logger = logging.getLogger(__name__)
 def save_class_names(cfg: AppConfig) -> None:
     """Ensure canonical class mapping is written to models/class_names.json."""
     classes = cfg.data.classes
-    display_mapping = {
-        "Benign": "Hematogones",
-        "Early": "Early Pre-B ALL",
-        "Pre": "Pre-B ALL",
-        "Pre-B": "Pre-B ALL",
-        "Pro": "Pro-B ALL",
-    }
+    display_mapping = cfg.data.display_names or {c: c for c in classes}
     class_meta = {
         "class_order": classes,
         "display_names": {c: display_mapping.get(c, c) for c in classes},

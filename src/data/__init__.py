@@ -1,1 +1,1 @@
-"""Data utilities: pairing, splitting, and tf.data pipeline."""
+"""Data utilities: dataset loading, splitting, and tf.data pipeline."""

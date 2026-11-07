@@ -9,7 +9,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import yaml
@@ -25,11 +25,10 @@ _DEFAULT_CONFIG = _REPO_ROOT / "configs" / "config.yaml"
 class DataConfig:
     raw_dir: Path
     splits_dir: Path
-    original_subdir: str
-    segmented_subdir: str
     classes: List[str]
     val_fraction: float
     test_fraction: float
+    display_names: Dict[str, str] = field(default_factory=dict)
     processed_dir: Path = field(default_factory=lambda: _REPO_ROOT / "data" / "processed")
 
 
@@ -143,6 +142,13 @@ class AppConfig:
 
 
 # ── Loader ───────────────────────────────────────────────────────────────────
+def _resolve_path(p: str | Path, root: Path) -> Path:
+    p_obj = Path(p)
+    if p_obj.is_absolute():
+        return p_obj
+    return root / p_obj
+
+
 def load_config(config_path: Path | str | None = None) -> AppConfig:
     """Load and validate ``config.yaml``, returning a typed ``AppConfig``.
 
@@ -168,15 +174,18 @@ def load_config(config_path: Path | str | None = None) -> AppConfig:
 
     data_raw = raw["data"]
     processed_val = data_raw.get("processed_dir", "data/processed")
+    raw_dir_resolved = _resolve_path(data_raw["raw_dir"], root)
+    if not raw_dir_resolved.exists() and (root / "data" / "fake_raw").exists():
+        raw_dir_resolved = root / "data" / "fake_raw"
+
     data = DataConfig(
-        raw_dir=root / data_raw["raw_dir"],
-        splits_dir=root / data_raw["splits_dir"],
-        original_subdir=data_raw["original_subdir"],
-        segmented_subdir=data_raw["segmented_subdir"],
+        raw_dir=raw_dir_resolved,
+        splits_dir=_resolve_path(data_raw["splits_dir"], root),
         classes=data_raw["classes"],
+        display_names=data_raw.get("display_names", {}),
         val_fraction=data_raw["val_fraction"],
         test_fraction=data_raw["test_fraction"],
-        processed_dir=root / processed_val,
+        processed_dir=_resolve_path(processed_val, root),
     )
 
     img_raw = raw["image"]
@@ -202,7 +211,7 @@ def load_config(config_path: Path | str | None = None) -> AppConfig:
     ref_path = norm_raw.get("reference_image_path")
     normalization = NormalizationConfig(
         use_reinhard=norm_raw.get("use_reinhard", False),
-        reference_image_path=root / ref_path if ref_path else None,
+        reference_image_path=_resolve_path(ref_path, root) if ref_path else None,
     )
 
     aug_raw = raw["augmentation"]
@@ -218,11 +227,13 @@ def load_config(config_path: Path | str | None = None) -> AppConfig:
     )
 
     mdl_raw = raw["model"]
+    # Derive num_classes dynamically from classes list
+    num_classes = len(data.classes)
     model = ModelConfig(
         backbone=mdl_raw["backbone"],
         dropout_rate=mdl_raw["dropout_rate"],
         embedding_dim=mdl_raw["embedding_dim"],
-        num_classes=mdl_raw["num_classes"],
+        num_classes=num_classes,
     )
 
     tr_raw = raw["training"]
@@ -242,12 +253,12 @@ def load_config(config_path: Path | str | None = None) -> AppConfig:
 
     p_raw = raw["paths"]
     paths = PathsConfig(
-        models_dir=root / p_raw["models_dir"],
+        models_dir=_resolve_path(p_raw["models_dir"], root),
         model_filename=p_raw["model_filename"],
-        class_names_file=root / p_raw["class_names_file"],
-        reports_dir=root / p_raw["reports_dir"],
-        figures_dir=root / p_raw["figures_dir"],
-        metrics_dir=root / p_raw["metrics_dir"],
+        class_names_file=_resolve_path(p_raw["class_names_file"], root),
+        reports_dir=_resolve_path(p_raw["reports_dir"], root),
+        figures_dir=_resolve_path(p_raw["figures_dir"], root),
+        metrics_dir=_resolve_path(p_raw["metrics_dir"], root),
         hf_repo_id=p_raw.get("hf_repo_id", "HemangDulange/leukemia-all-classifier"),
         hf_filename=p_raw.get("hf_filename", "dual_stream.keras"),
     )

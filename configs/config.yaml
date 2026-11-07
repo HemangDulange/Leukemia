@@ -3,17 +3,22 @@ seed: 42
 
 # ── Data ────────────────────────────────────────────────────────────────────
 data:
-  raw_dir: data/raw
+  raw_dir: /kaggle/input/datasets/shimantokumar/multi-class-leukemia-dataset-all-subtypesamlnormal/leukemia_datasets
   splits_dir: data/splits
   processed_dir: data/processed
-  original_subdir: Original
-  segmented_subdir: Segmented
-  # Canonical class order  (folder name → display name handled in class_names.json)
+  # Canonical class order
   classes:
-    - Benign
-    - Early
-    - Pre
-    - Pro
+    - AML
+    - Early_PreB
+    - Normal
+    - PreB
+    - ProB
+  display_names:
+    AML: "AML (Myeloid)"
+    Early_PreB: "Early Pre-B ALL"
+    Normal: "Normal"
+    PreB: "Pre-B ALL"
+    ProB: "Pro-B ALL"
   val_fraction: 0.15
   test_fraction: 0.15
 
@@ -25,10 +30,10 @@ image:
 
 # ── Segmentation (HSV colour thresholding for Stream A) ──────────────────────
 segmentation:
-  # Purple / blue nuclei (from Kaggle reference notebook)
+  # Purple / blue nuclei
   lower_nuclei: [100, 40, 40]
   upper_nuclei: [160, 255, 255]
-  # Pink / purple cytoplasm (from Kaggle reference notebook)
+  # Pink / purple cytoplasm
   lower_cytoplasm: [120, 20, 100]
   upper_cytoplasm: [170, 100, 255]
   # Morphological cleanup
@@ -59,7 +64,7 @@ model:
   backbone: EfficientNetB0   # used by backbones.py
   dropout_rate: 0.4
   embedding_dim: 256         # dense layer after GAP in each stream
-  num_classes: 4
+  num_classes: 5
 
 # ── Training ────────────────────────────────────────────────────────────────
 training:

@@ -5,13 +5,13 @@ Eliminates train/serve skew by generating Segmented images using the exact same
 HSV morphology pipeline (src/preprocessing/pair.py:prepare_pair) used in serving.
 
 Reads train.csv, val.csv, and test.csv from data/splits/, processes each image:
-- Load original blood smear with PIL .convert("RGB")
+- Load original blood smear with safe RGB loader (handles 16-bit, palette, alpha)
 - Call prepare_pair() -> (orig_224, seg_224)
 - Save lossless PNGs to:
     data/processed/orig/<class>/<name>.png
     data/processed/seg/<class>/<name>.png
 - Skips already-existing files for fast resuming.
-- Displays a tqdm progress bar and prints total counts (expect 3256 per folder on full dataset).
+- Displays a tqdm progress bar and prints total counts (expect 9097 per folder on full dataset).
 """
 from __future__ import annotations
 
@@ -32,8 +32,11 @@ from PIL import Image
 from tqdm import tqdm
 
 from src.config import AppConfig, load_config
-from src.data.splits import make_splits
+from src.data.splits import load_rgb_image, make_splits
 from src.preprocessing.pair import prepare_pair
+
+# Prevent PIL DecompressionBombError on large images (up to 2560x1920 or higher)
+Image.MAX_IMAGE_PIXELS = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -138,8 +141,8 @@ def precompute_dataset(
             continue
 
         try:
-            # Load with PIL .convert("RGB")
-            pil_img = Image.open(orig_path).convert("RGB")
+            # Safe RGB load handling 16-bit, palette, alpha TIFF/BMP
+            pil_img = load_rgb_image(orig_path)
 
             # Shared preprocessing function: segment full-resolution then resize
             orig_arr, seg_arr = prepare_pair(
@@ -171,8 +174,8 @@ def precompute_dataset(
     logger.info("=" * 60)
     logger.info("Newly processed : %d", processed_count)
     logger.info("Skipped (cached): %d", skipped_count)
-    logger.info("Total in data/processed/orig: %d (expect 3256 on full dataset)", total_orig)
-    logger.info("Total in data/processed/seg : %d (expect 3256 on full dataset)", total_seg)
+    logger.info("Total in data/processed/orig: %d (expect 9097 on full dataset)", total_orig)
+    logger.info("Total in data/processed/seg : %d (expect 9097 on full dataset)", total_seg)
     logger.info("=" * 60)
 
     return total_orig, total_seg

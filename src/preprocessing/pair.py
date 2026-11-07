@@ -24,6 +24,9 @@ from src.preprocessing.segmentation import segment_image
 
 logger = logging.getLogger(__name__)
 
+# Prevent PIL DecompressionBombError on large microscopic scans (e.g. 2560x1920)
+Image.MAX_IMAGE_PIXELS = None
+
 
 def prepare_pair(
     rgb_input: Union[np.ndarray, Image.Image],
@@ -59,7 +62,18 @@ def prepare_pair(
 
     # 1. Ensure RGB uint8 NumPy array from input
     if isinstance(rgb_input, Image.Image):
-        rgb_uint8 = np.array(rgb_input.convert("RGB"))
+        if rgb_input.mode in ("I;16", "I;16B", "I;16L", "I", "F"):
+            arr = np.array(rgb_input, dtype=np.float32)
+            max_val = float(arr.max()) if arr.size > 0 else 1.0
+            if max_val > 255.0:
+                arr = (arr / max(max_val, 65535.0)) * 255.0
+            rgb_uint8 = np.array(Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8)).convert("RGB"))
+        elif rgb_input.mode in ("RGBA", "LA") or (rgb_input.mode == "P" and "transparency" in rgb_input.info):
+            rgba = rgb_input.convert("RGBA")
+            bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            rgb_uint8 = np.array(Image.alpha_composite(bg, rgba).convert("RGB"))
+        else:
+            rgb_uint8 = np.array(rgb_input.convert("RGB"))
     elif isinstance(rgb_input, np.ndarray):
         if rgb_input.dtype != np.uint8:
             rgb_uint8 = np.clip(rgb_input, 0, 255).astype(np.uint8)

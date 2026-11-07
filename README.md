@@ -1,12 +1,12 @@
-# 🩸 Leukemia ALL Classifier
+# 🩸 Leukemia Multi-Class Classifier
 
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://share.streamlit.io)
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A dual-stream deep learning classifier for **Acute Lymphoblastic Leukemia (ALL)** blood-smear images, deployed with Streamlit.
+A dual-stream deep learning classifier for multi-class **Leukemia Subtypes & Normal Controls** from peripheral blood smear (PBS) microscopic images, deployed with Streamlit.
 
-The pipeline combines automated **HSV morphological color thresholding** (Stream A) to isolate intracellular Giemsa-stained structures with the **raw smear image** (Stream B) to capture contextual morphology, fusing both representations into a classification head for 4 distinct subtypes.
+The pipeline combines automated **HSV morphological color thresholding** (Stream A) targeting Giemsa-stained leukocyte chromatin and cytoplasm with the **unsegmented smear image** (Stream B) to capture contextual morphology, fusing both representations into a classification head for 5 distinct classes.
 
 ---
 
@@ -21,14 +21,14 @@ Original Smear Image (224 × 224 × 3)
          │                                         │
     BGR ➔ HSV Transform                       Smear Input
          │                                         │
-  Dual-Range Threshold                   EfficientNet Preprocessing
-  - Nuclei: Purple/Blue                            │
-  - Cyto:   Pink/Purple                       Backbone B
-         │                              (EfficientNetB0 + GAP)
-  Morph Open & Close                               │
-         │                                   Feature Vec B (D,)
-  Remove Small Blobs                               │
+  Dual-Range Threshold                    Pixel range [0, 255]
+  - Nuclei: Purple/Blue                   (Rescaling inside backbone)
+  - Cyto:   Pink/Purple                            │
+         │                                    Backbone B
+  Morph Open & Close                     (EfficientNetB0 + GAP)
          │                                         │
+  Remove Small Blobs                              │
+         │                                Feature Vec B (D,)
   Impose Binary Mask                               │
   (Background ➔ Black)                             │
          │                                         │
@@ -45,45 +45,66 @@ Original Smear Image (224 × 224 × 3)
                              │
                       Dropout (p = 0.4)
                              │
-                  Dense Softmax (4 Classes)
+                  Dense Softmax (5 Classes)
                              │
-            ┌────────────────┴────────────────┐
-            ▼                                 ▼
-      Hematogones (Benign)             Early Pre-B ALL
-      Pre-B ALL                        Pro-B ALL
+        ┌─────────────┬──────┴──────┬─────────────┐
+        ▼             ▼             ▼             ▼
+       AML       Early Pre-B     Normal        Pre-B ALL / Pro-B ALL
 ```
 
 ---
 
-## 🎯 Target Classes
+## 🎯 Target Classes & Dataset
 
-All models, scripts, and evaluation metrics enforce canonical class ordering via [`models/class_names.json`](models/class_names.json):
+The classifier operates on the **Multi-Class Leukemia Dataset (ALL Subtypes, AML, Normal)**:
+- **Kaggle Path**: `/kaggle/input/datasets/shimantokumar/multi-class-leukemia-dataset-all-subtypesamlnormal/leukemia_datasets`
+- **Total Images**: 9,097 images across 5 flat class folders:
+  - `AML`: 2,000 images
+  - `Early_PreB`: 1,738 images
+  - `Normal`: 2,000 images
+  - `PreB`: 1,800 images
+  - `ProB`: 1,559 images
+- **Mixed Formats & Resolutions**: `.jpg`, `.bmp`, `.tiff`, `.png` ranging from $400 \times 400$ up to $2560 \times 1920$.
 
-| Class Index | Raw Folder Name | Clinical Display Name | Description |
-|:-----------:|:---------------:|:---------------------:|:------------|
-| **0** | `Benign` | **Hematogones** | Normal B-cell precursors (non-leukemic control) |
-| **1** | `Early` | **Early Pre-B ALL** | Early precursor B-cell Acute Lymphoblastic Leukemia |
-| **2** | `Pre` | **Pre-B ALL** | Pre-B Acute Lymphoblastic Leukemia |
-| **3** | `Pro` | **Pro-B ALL** | Pro-B Acute Lymphoblastic Leukemia |
+Canonical class mapping is configured via `configs/config.yaml` and persisted to `models/class_names.json`:
+
+| Class Index | Raw Folder Name | Clinical Display Name | Description | Count |
+|:-----------:|:---------------:|:---------------------:|:------------|:-----:|
+| **0** | `AML` | **AML (Myeloid)** | Acute Myeloid Leukemia blast cells | 2,000 |
+| **1** | `Early_PreB` | **Early Pre-B ALL** | Early precursor B-cell Acute Lymphoblastic Leukemia | 1,738 |
+| **2** | `Normal` | **Normal** | Healthy non-leukemic control leukocytes | 2,000 |
+| **3** | `PreB` | **Pre-B ALL** | Pre-B Acute Lymphoblastic Leukemia | 1,800 |
+| **4** | `ProB` | **Pro-B ALL** | Pro-B Acute Lymphoblastic Leukemia | 1,559 |
+
+---
+
+## 🔍 Near-Duplicate-Aware Perceptual Hash Splits
+
+To guarantee absolute split independence and prevent data leakage:
+1. **Canonical Perceptual Hashing**:
+   - Each image is downsampled: $64 \times 64$ RGB $\rightarrow 8 \times 8$ grayscale $\rightarrow$ mean-thresholded 64-bit boolean string.
+   - Evaluated across all 8 D4 dihedral symmetries (4 rotations $\times$ horizontal flip), taking the lexicographical minimum bit string.
+   - Rotated, mirrored, or identical image variants receive the exact same canonical hash and `group_id`.
+2. **Stratified Group Splitting (`StratifiedGroupKFold`)**:
+   - 7 folds are evaluated with fixed seed 42 (Fold 0 = Test ~15%, Fold 1 = Validation ~15%, Folds 2–6 = Train ~70%).
+   - All near-duplicates belonging to the same group land strictly in the same split.
 
 ---
 
 ## 🔬 Unified Preprocessing & Zero Train/Serve Skew
 
-To prevent train/serve skew (where the offline model trains on third-party pre-segmented images while live serving generates fresh segmentation masks), the pipeline unifies all image processing in [`src/preprocessing/pair.py`](src/preprocessing/pair.py):
+All stages of the project enforce one shared preprocessing pipeline via `src/preprocessing/pair.py`:
 
-- **Single Pipeline Function (`prepare_pair`)**:
-  Both training and real-time Streamlit inference execute the exact same sequence:
-  1. Input is loaded via PIL `.convert("RGB")`.
-  2. Full-resolution RGB image is passed to `segment_image()` (handling BGR/RGB color channels consistently and applying dual-range HSV color thresholding + morphological filtering).
-  3. Both the original smear and segmented cell images are resized to $224 \times 224$ using area interpolation (`cv2.INTER_AREA`).
-  4. Pixel values are kept as `float32` in the raw $[0, 255]$ range, matching Keras EfficientNet's internal Rescaling layer.
-- **Offline Precomputation (`scripts/precompute_segmented.py`)**:
-  Before training, lossless PNG pairs are generated in `data/processed/orig/<class>/` and `data/processed/seg/<class>/`. The dataset loader (`src/data/dataset.py`) reads directly from this cache, never touching raw pre-made `Segmented/` folders.
-- **Serving Skew Verification (`scripts/check_serving_skew.py`)**:
-  An automated CI/CD check evaluates the test set image bytes through `Predictor` and asserts test accuracy remains within $\le 1.5\%$ of batch evaluation.
-- **Pre-segmented Upload Protection**:
-  The Streamlit app checks uploaded smears: if $>70\%$ of pixels are near-black, it warns the user: *"This looks like an already-segmented image. Please upload the original blood smear."*
+- **Single Function (`prepare_pair`)**:
+  1. Accepts PIL image or uint8 array (safe 8-bit RGB loader supports 16-bit TIFFs, palette, and alpha channels).
+  2. Full-resolution HSV morphological segmentation generates clean cell mask.
+  3. Original and segmented images resized with `cv2.INTER_AREA` to $224 \times 224$.
+  4. Returns `float32` arrays in raw $[0, 255]$ range, matching Keras EfficientNet's internal Rescaling layer.
+- **Precomputed Cache (`scripts/precompute_segmented.py`)**:
+  - Precomputes and caches lossless PNG pairs to `data/processed/orig/<class>/` and `data/processed/seg/<class>/`.
+  - Automatically invoked before training if cache is absent.
+- **Mask Validation Grid (`scripts/preview_masks.py`)**:
+  - Samples 6 random images per class (seed 42) and renders a 30-image grid (`Original | Mask | Segmented`) to `reports/figures/mask_preview.png`.
 
 ---
 
@@ -95,7 +116,7 @@ To prevent train/serve skew (where the offline model trains on third-party pre-s
 
 ### 2. Clone Repository
 ```bash
-git clone https://github.com/HemangDulange/Leukemia.git
+git clone -b new-dataset https://github.com/HemangDulange/Leukemia.git
 cd Leukemia
 ```
 
@@ -112,87 +133,41 @@ pip install -r requirements-train.txt
 
 ## 💻 Running the Streamlit App Locally
 
-To launch the interactive diagnostic interface with upload validation and Grad-CAM explainability:
-
 ```bash
 streamlit run app/streamlit_app.py
 ```
 
-The application opens at `http://localhost:8501`.
-- **Bundled Samples**: Test immediately with preloaded peripheral blood-smear samples in `app/samples/`.
-- **Visual Explainability**: Side-by-side inspection across Original Smear, HSV Mask, Segmented Cell, and Grad-CAM Activation Heatmap.
-- **Model Loading**: Automatically searches for local weights at `models/dual_stream.keras`; if absent, safely downloads published weights from Hugging Face Hub.
-
----
-
-## ☁️ Deployment on Streamlit Community Cloud
-
-This project is tailored for **Streamlit Community Cloud** (under the 1 GB RAM container limit):
-- Pinned `tensorflow-cpu` and `opencv-python-headless` (zero GPU/display overhead).
-- Peak inference memory is ~450 MB (well below the 1024 MB resource limit).
-- Model weights exceeding GitHub's 100 MB limit are resolved automatically via [`src/inference/model_loader.py`](src/inference/model_loader.py).
-
-### Deployment Steps:
-1. Push your repository to GitHub.
-2. Sign in to [Streamlit Community Cloud](https://share.streamlit.io/).
-3. Click **"New App"** and select:
-   - **Repository**: `HemangDulange/Leukemia`
-   - **Branch**: `main`
-   - **Main file path**: `app/streamlit_app.py`
-4. Under **Advanced Settings**, confirm Python **3.10**.
-5. Click **Deploy!**
+The application opens at `http://localhost:8501`:
+- **Dynamic 5-Class Interface**: Automatically populates classes, color badges, and probability distributions from `models/class_names.json`.
+- **Visual Inspection**: Displays Original Smear, HSV Binary Mask, Segmented Stream, and Grad-CAM Activation Heatmap.
+- **Graceful Fallbacks**: Works smoothly even if weights are missing (provides real-time segmentation preview) or if sample folders are empty.
 
 ---
 
 ## ⚡ How to Train on Kaggle (Free GPU)
 
-Full training requires GPU compute and should not be run on local laptops without a dedicated GPU.
+Full training requires GPU compute:
 
-### Method A: Using the Provided Kaggle Notebook
-1. Open the included notebook: [`notebooks/kaggle_train.ipynb`](notebooks/kaggle_train.ipynb).
-2. Upload it to [Kaggle Notebooks](https://www.kaggle.com/code).
-3. Set **Accelerator** to **GPU T4 x2** or **P100**.
-4. In the right panel, click **Add Input** and search for:
-   `mehradaria/leukemia` (or `Acute Lymphoblastic Leukemia (ALL) image dataset`).
-5. Run all cells. The notebook will:
-   - Clone this repository
-   - Link `data/raw/Original` and `data/raw/Segmented`
-   - Generate stratified splits (70% train, 15% val, 15% test, seed 42)
-   - Execute Phase 1 head training (`lr = 1e-3`) and Phase 2 fine-tuning (`lr = 1e-5`)
-   - Output `dual_stream.keras`, metrics CSV, and publication plots.
+1. In Kaggle Notebooks, select **Accelerator**: **GPU T4 x2** or **P100**.
+2. Mount the dataset:
+   `/kaggle/input/datasets/shimantokumar/multi-class-leukemia-dataset-all-subtypesamlnormal/leukemia_datasets`
+3. Execute the CLI pipeline:
+   ```bash
+   # 1. Discover images and generate duplicate-aware stratified splits:
+   python scripts/prepare_data.py --force
 
-### Method B: Command-Line Training
-```bash
-# 1. Generate stratified reproducible splits
-python scripts/prepare_data.py --force --samples 50
+   # 2. Visual verification grid of segmentation masks:
+   python scripts/preview_masks.py
 
-# 2. Local smoke-test (1 epoch, 128px, 64 samples — safe for any laptop):
-python scripts/train.py --smoke-test
+   # 3. Two-phase training:
+   python scripts/train.py
 
-# 3. Full GPU training (Kaggle / Colab):
-python scripts/train.py
-```
+   # 4. Evaluation and publication metrics:
+   python scripts/evaluate.py --ablation
 
----
-
-## 📊 Evaluation & Ablation Study
-
-Evaluate the trained weights on the frozen test split:
-
-```bash
-# Standard evaluation (Accuracy, Weighted Precision/Recall/F1, and OvR AUC)
-python scripts/evaluate.py
-
-# Run ablation study comparing single-stream vs. dual-stream synergy
-python scripts/evaluate.py --ablation
-```
-
-Outputs generated in `reports/`:
-- `reports/metrics/evaluation.csv`: Full metric score summary.
-- `reports/metrics/ablation_study.csv`: Empirical performance across Segmented-only, Original-only, and Dual-stream.
-- `reports/figures/confusion_matrix.png`: Normalized confusion matrix with cell counts (300 DPI).
-- `reports/figures/roc_curves.png`: One-vs-Rest ROC curves per subtype (300 DPI).
-- `reports/figures/ablation_comparison.png`: Ablation bar chart (300 DPI).
+   # 5. Extract representative sample images closest to median confidence:
+   python scripts/make_samples.py
+   ```
 
 ---
 
@@ -200,64 +175,53 @@ Outputs generated in `reports/`:
 
 ```
 leukemia-all-classifier/
-├── .streamlit/
-│   └── config.toml             # Dark theme & upload security settings
 ├── configs/
-│   └── config.yaml             # Single source of truth (paths, thresholds, hyperparameters)
-├── data/                       # Dataset directory (gitignored)
-│   ├── raw/Original            # Raw blood smear images
-│   ├── processed/              # Lossless precomputed PNGs (zero train/serve skew)
-│   │   ├── orig/<class>/
-│   │   └── seg/<class>/
-│   └── splits/{train, val, test}.csv
-├── notebooks/
-│   └── kaggle_train.ipynb      # End-to-end Kaggle GPU training notebook
-├── src/                        # Core modular library
-│   ├── config.py               # Typed AppConfig loader
+│   └── config.yaml             # Single source of truth (classes, display names, hyperparameters)
+├── data/
+│   ├── processed/              # Lossless precomputed PNGs (orig/ and seg/)
+│   └── splits/                 # train.csv, val.csv, test.csv
+├── models/
+│   ├── class_names.json        # Canonical 5-class ordering & display names
+│   └── dual_stream.keras       # Trained dual-stream model weights
+├── src/
+│   ├── config.py               # Typed AppConfig loader with dynamic num_classes
 │   ├── data/
-│   │   ├── pairing.py          # Matches Original pairs & generates labels
-│   │   ├── splits.py           # Stratified split generator & class-weight computation
+│   │   ├── splits.py           # Perceptual hash near-duplicate grouping & StratifiedGroupKFold
 │   │   └── dataset.py          # Dual-input tf.data pipeline reading processed cache
 │   ├── preprocessing/
 │   │   ├── pair.py             # Single unified prepare_pair function (train & serve)
 │   │   ├── segmentation.py     # BGR->HSV thresholding & morphological filtering
-│   │   ├── normalization.py    # EfficientNet scaling & Reinhard stain transfer
 │   │   └── augmentation.py     # Joint spatial Keras augmentation layers (train-only)
 │   ├── models/
-│   │   ├── backbones.py        # Backbone factory (EfficientNetB0-B5, GAP)
-│   │   └── dual_stream.py      # Dual-stream functional model & unfreezing utilities
+│   │   ├── backbones.py        # EfficientNet backbone factory
+│   │   └── dual_stream.py      # Dual-stream functional model & Phase 2 unfreezing
 │   ├── training/
-│   │   ├── callbacks.py        # EarlyStopping, ModelCheckpoint (val_accuracy)
-│   │   └── train.py            # Two-phase training loop (Head -> Top 30 layers)
+│   │   ├── callbacks.py        # EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+│   │   └── train.py            # Two-phase training loop (Phase 1 Head -> Phase 2 Fine-tuning)
 │   ├── evaluation/
 │   │   ├── metrics.py          # Multiclass OvR AUC, classification report, CSV export
-│   │   ├── plots.py            # 300 DPI confusion matrices, ROC, and ablation plots
+│   │   ├── plots.py            # 300 DPI confusion matrices, ROC, and history plots
 │   │   └── gradcam.py          # Grad-CAM heatmap overlay from segmented backbone
 │   └── inference/
 │       ├── model_loader.py     # Local model loader with Hugging Face Hub download fallback
 │       └── predictor.py        # Production inference engine used by Streamlit
-├── scripts/                    # CLI commands
-│   ├── prepare_data.py         # Generate stratified CSV splits
+├── scripts/
+│   ├── prepare_data.py         # Discover images and generate reproducible splits
 │   ├── precompute_segmented.py # Precompute unified PNG pairs
-│   ├── train.py                # Train model (calls precompute automatically if needed)
+│   ├── preview_masks.py        # 30-image mask preview grid across all 5 classes
+│   ├── train.py                # Train model (calls precompute automatically)
 │   ├── evaluate.py             # Evaluate test split performance & metrics
-│   ├── check_serving_skew.py   # Verify live Predictor vs offline pipeline parity (<=1.5%)
-│   ├── make_samples.py         # Pick 1 sample per class & bundle samples.zip
-│   └── predict.py              # CLI batch inference
+│   ├── check_serving_skew.py   # Verify live Predictor vs offline pipeline parity
+│   └── make_samples.py         # Pick median-confidence samples per class & bundle zip
 ├── app/
-│   ├── streamlit_app.py        # Interactive Streamlit application
-│   ├── samples/                # Bundled PBS smear test samples for live app
-│   └── components/             # Modular UI components
-├── models/
-│   ├── class_names.json        # Canonical class ordering & display names
-│   └── dual_stream.keras       # Model weights
+│   └── streamlit_app.py        # Interactive Streamlit application
 ├── reports/
-│   ├── figures/                # High-res 300 DPI diagnostic figures
+│   ├── figures/                # High-res diagnostic figures (mask_preview.png, confusion_matrix.png)
 │   └── metrics/                # evaluation.csv, history.json, ablation_study.csv
-├── tests/                      # Automated unit & integration tests
-├── requirements.txt            # Lightweight deployment dependencies
-├── requirements-train.txt      # Full GPU training dependencies
-└── runtime.txt                 # Python 3.10 runtime declaration for Streamlit Cloud
+├── tests/
+│   ├── make_fake_dataset.py    # Synthetic 5-class dataset generator for smoke testing
+│   └── test_data.py            # Unit tests for perceptual hash and data pipelines
+└── requirements.txt            # Streamlit Cloud deployment requirements
 ```
 
 ---
@@ -267,6 +231,3 @@ leukemia-all-classifier/
 **For Educational, Academic, and Scientific Research Use Only.**
 
 This software is an artificial intelligence research demonstration and is **not** a certified medical diagnostic device. It is not intended to diagnose, treat, cure, or prevent any disease. Clinical decisions regarding leukemia diagnosis must only be made by qualified medical specialists based on bone marrow aspirates, comprehensive flow cytometry immunophenotyping, and cytogenetic analysis.
-
----
-

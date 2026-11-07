@@ -22,10 +22,13 @@ from PIL import Image
 import tensorflow as tf
 
 from src.config import AppConfig, load_config
+from src.data.splits import load_rgb_image
 from src.evaluation.gradcam import compute_gradcam_heatmap, overlay_heatmap
 from src.preprocessing.pair import prepare_pair
 
 logger = logging.getLogger(__name__)
+
+Image.MAX_IMAGE_PIXELS = None
 
 
 class Predictor:
@@ -55,7 +58,7 @@ class Predictor:
         return load_trained_model(cfg=self._cfg, custom_path=self._model_path)
 
     def _load_class_names(self) -> Dict[str, Any]:
-        """Load canonical class mappings from models/class_names.json."""
+        """Load canonical class mappings from models/class_names.json or config."""
         path = self._cfg.paths.class_names_file
         if path.exists():
             with path.open("r", encoding="utf-8") as fh:
@@ -63,13 +66,7 @@ class Predictor:
 
         # Fallback to config classes if file does not exist yet
         classes = self._cfg.data.classes
-        display_mapping = {
-            "Benign": "Hematogones",
-            "Early": "Early Pre-B ALL",
-            "Pre": "Pre-B ALL",
-            "Pre-B": "Pre-B ALL",
-            "Pro": "Pro-B ALL",
-        }
+        display_mapping = self._cfg.data.display_names or {c: c for c in classes}
         return {
             "class_order": classes,
             "display_names": {c: display_mapping.get(c, c) for c in classes},
@@ -98,7 +95,7 @@ class Predictor:
             - ``predicted_label``: Display name of the top class (e.g. 'Hematogones').
             - ``predicted_class``: Alias for predicted_label.
             - ``predicted_folder``: Internal class folder name ('Benign', 'Early', etc.).
-            - ``label_index``: Integer class index in [0, 3].
+            - ``label_index``: Integer class index in [0, num_classes-1].
             - ``class_probabilities``: Dict mapping display name -> probability.
             - ``probabilities``: List of (display_name, probability) tuples.
             - ``segmented_image``: Segmented PIL Image with black background.
@@ -109,7 +106,7 @@ class Predictor:
         """
         # 1. Standardize input to PIL Image in RGB format
         if isinstance(image, (str, Path)):
-            pil_image = Image.open(str(image)).convert("RGB")
+            pil_image = load_rgb_image(image)
         elif isinstance(image, Image.Image):
             pil_image = image.convert("RGB")
         elif isinstance(image, np.ndarray):

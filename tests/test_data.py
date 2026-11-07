@@ -1,16 +1,22 @@
-"""Unit tests for src/data: pairing, splits, class weights, and tf.data dataset."""
+"""Unit tests for src/data: canonical perceptual hash, splits, class weights, and tf.data dataset."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from PIL import Image
 import pytest
 
 from src.config import load_config
 from src.data.dataset import build_dataset
-from src.data.pairing import build_pairs, report_unmatched_files
-from src.data.splits import compute_class_weights, make_splits, print_class_distribution
+from src.data.splits import (
+    compute_canonical_hash,
+    compute_class_weights,
+    load_rgb_image,
+    make_splits,
+    print_class_distribution,
+)
 
 
 @pytest.fixture(scope="module")
@@ -20,77 +26,84 @@ def cfg():
 
 @pytest.fixture()
 def mock_df() -> pd.DataFrame:
-    """Create a mock paired DataFrame with 20 samples across 4 classes."""
+    """Create a mock DataFrame with 25 samples across 5 classes."""
     data = []
-    for idx in range(20):
-        cls_idx = idx % 4
-        cls_name = ["Benign", "Early", "Pre-B", "Pro"][cls_idx]
+    classes = ["AML", "Early_PreB", "Normal", "PreB", "ProB"]
+    for idx in range(25):
+        cls_idx = idx % 5
+        cls_name = classes[cls_idx]
         data.append(
             {
                 "original_path": f"dummy/path/orig_{idx}.jpg",
-                "segmented_path": f"dummy/path/seg_{idx}.jpg",
                 "class_folder": cls_name,
                 "label_index": cls_idx,
                 "filename": f"sample_{idx}.jpg",
+                "canonical_hash": f"hash_{idx}",
+                "group_id": idx,
             }
         )
     return pd.DataFrame(data)
 
 
-class TestPairing:
-    def test_report_unmatched_files(self):
-        orig = {"img1": Path("orig/img1.jpg"), "img2": Path("orig/img2.jpg")}
-        seg = {"img2": Path("seg/img2.jpg"), "img3": Path("seg/img3.jpg")}
-        unmatched_orig, unmatched_seg = report_unmatched_files(orig, seg, "TestClass")
-        assert unmatched_orig == {"img1"}
-        assert unmatched_seg == {"img3"}
+class TestPerceptualHash:
+    def test_canonical_hash_invariance(self):
+        """Verify canonical hash is identical across rotations and flips."""
+        pattern = np.zeros((64, 64, 3), dtype=np.uint8)
+        pattern[10:30, 10:30] = [220, 100, 50]
+        pattern[40:60, 40:60] = [50, 150, 220]
+        img = Image.fromarray(pattern)
+
+        h_orig = compute_canonical_hash(img)
+        h_rot90 = compute_canonical_hash(img.rotate(90))
+        h_rot180 = compute_canonical_hash(img.rotate(180))
+        h_rot270 = compute_canonical_hash(img.rotate(270))
+        h_flip_lr = compute_canonical_hash(img.transpose(Image.FLIP_LEFT_RIGHT))
+        h_flip_tb = compute_canonical_hash(img.transpose(Image.FLIP_TOP_BOTTOM))
+
+        assert h_orig == h_rot90 == h_rot180 == h_rot270 == h_flip_lr == h_flip_tb
 
 
 class TestSplitsAndWeights:
     def test_compute_class_weights_balanced(self, mock_df):
-        # 5 samples per class -> equal weights
-        weights = compute_class_weights(mock_df, num_classes=4)
-        assert len(weights) == 4
+        # 5 samples per class across 5 classes -> equal weights
+        weights = compute_class_weights(mock_df, num_classes=5)
+        assert len(weights) == 5
         for w in weights.values():
             assert abs(w - 1.0) < 1e-4
 
     def test_compute_class_weights_imbalanced(self):
         df = pd.DataFrame({
-            "label_index": [0, 0, 0, 0, 1, 1, 2, 3],
+            "label_index": [0, 0, 0, 0, 1, 1, 2, 3, 4],
         })
-        weights = compute_class_weights(df, num_classes=4)
-        # Class 0 has 4 samples (most frequent) -> lowest weight
-        # Class 2 and 3 have 1 sample -> highest weight
-        assert weights[0] < weights[1] < weights[2]
-        assert weights[2] == weights[3]
+        weights = compute_class_weights(df, num_classes=5)
+        assert weights[0] < weights[1]
+        assert weights[2] == weights[3] == weights[4]
 
     def test_print_class_distribution(self, mock_df, cfg):
-        train = mock_df.iloc[:12]
-        val = mock_df.iloc[12:16]
-        test = mock_df.iloc[16:]
+        train = mock_df.iloc[:15]
+        val = mock_df.iloc[15:20]
+        test = mock_df.iloc[20:]
         dist_df = print_class_distribution(train, val, test, cfg.data.classes)
-        assert len(dist_df) == 4
+        assert len(dist_df) == 5
         assert "train_count" in dist_df.columns
-        assert dist_df["total_count"].sum() == 20
+        assert dist_df["total_count"].sum() == 25
 
 
 class TestDatasetPipeline:
-    def test_dataset_yields_dict_structure(self, cfg, mock_df, tmp_path):
-        """Verify dataset yields ({"original": ..., "segmented": ...}, label)."""
+    def test_dataset_yields_dict_structure(self, cfg, tmp_path):
+        """Verify dataset yields ({"original": ..., "segmented": ...}, label) with 5 classes."""
         import cv2
 
-        # Create real dummy image files in tmp_path so _py_func can read them
-        img_file = tmp_path / "dummy.jpg"
-        dummy_img = np.zeros((64, 64, 3), dtype=np.uint8)
+        img_file = tmp_path / "dummy.png"
+        dummy_img = np.full((64, 64, 3), 200, dtype=np.uint8)
         cv2.imwrite(str(img_file), dummy_img)
 
         df = pd.DataFrame([
             {
                 "original_path": str(img_file),
-                "segmented_path": str(img_file),
-                "class_folder": "Benign",
+                "class_folder": "AML",
                 "label_index": 0,
-                "filename": "dummy.jpg",
+                "filename": "dummy.png",
             }
         ])
 
@@ -99,4 +112,4 @@ class TestDatasetPipeline:
             assert isinstance(batch_x, dict)
             assert "original" in batch_x
             assert "segmented" in batch_x
-            assert batch_y.shape[-1] == cfg.model.num_classes
+            assert batch_y.shape[-1] == 5

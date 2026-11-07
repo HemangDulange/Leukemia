@@ -1,48 +1,129 @@
 """
-Stratified train / validation / test splits and class weight computation.
+Stratified train / validation / test splits with near-duplicate perceptual hashing.
 
-Generates ONE reproducible split (fixed seed 42) at file level and saves CSVs
-to ``data/splits/{train,val,test}.csv``.  Subsequent runs reload the saved CSVs
-to prevent any data leakage or reshuffling between validation and test sets.
+Discovers images per class folder (.jpg, .jpeg, .png, .bmp, .tif, .tiff), computes
+canonical rotation/flip-invariant perceptual hashes to group identical or near-duplicate
+images, and creates a reproducible 70/15/15 split using StratifiedGroupKFold (fixed seed 42).
+Subsequent runs reload the saved CSVs to guarantee zero data leakage.
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from PIL import Image
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 
 from src.config import AppConfig
-from src.data.pairing import build_pairs
 
 logger = logging.getLogger(__name__)
+
+VALID_EXTENSIONS: Set[str] = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+
+def load_rgb_image(img_path: Path | str) -> Image.Image:
+    """Safely open any supported image format and convert it to 8-bit RGB.
+
+    Handles 16-bit TIFFs (mode 'I;16', 'I', 'F'), palette images ('P'),
+    RGBA/LA with alpha, and grayscale ('L').
+    """
+    Image.MAX_IMAGE_PIXELS = None
+    with Image.open(img_path) as img:
+        if img.mode in ("I;16", "I;16B", "I;16L", "I", "F"):
+            arr = np.array(img, dtype=np.float32)
+            max_val = float(arr.max()) if arr.size > 0 else 1.0
+            if max_val > 255.0:
+                arr = (arr / max(max_val, 65535.0)) * 255.0
+            arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
+            return Image.fromarray(arr).convert("RGB")
+        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            rgba = img.convert("RGBA")
+            bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            alpha_composite = Image.alpha_composite(bg, rgba)
+            return alpha_composite.convert("RGB")
+        return img.convert("RGB")
+
+
+def compute_canonical_hash(img: Image.Image) -> str:
+    """Compute canonical 64-bit perceptual hash invariant across 8 D4 rotations/flips.
+
+    Steps:
+    1. 64x64 RGB thumbnail
+    2. 8x8 grayscale
+    3. Bit string (pixel > mean)
+    4. Lexicographical minimum over all 8 rotations and flips
+    """
+    thumb = img.resize((64, 64), Image.Resampling.BILINEAR)
+    gray = thumb.convert("L").resize((8, 8), Image.Resampling.BILINEAR)
+    arr = np.array(gray, dtype=np.float32)
+    mean_val = float(arr.mean())
+
+    bit_arrays: List[str] = []
+    base_variants = [arr, np.fliplr(arr)]
+    for base in base_variants:
+        for k in range(4):
+            rotated = np.rot90(base, k)
+            bits = (rotated > mean_val).astype(int).flatten()
+            bit_str = "".join(map(str, bits))
+            bit_arrays.append(bit_str)
+    return min(bit_arrays)
+
+
+def discover_dataset_images(cfg: AppConfig) -> pd.DataFrame:
+    """Scan raw directory for images across all configured classes and compute canonical hashes."""
+    raw_dir = cfg.data.raw_dir
+    classes = cfg.data.classes
+    records = []
+
+    logger.info("Discovering images in %s across %d classes...", raw_dir, len(classes))
+    for class_idx, class_name in enumerate(classes):
+        class_folder = raw_dir / class_name
+        if not class_folder.exists():
+            logger.warning("Class directory not found: %s", class_folder)
+            continue
+
+        file_paths = [
+            p for p in class_folder.rglob("*")
+            if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
+        ]
+        file_paths.sort(key=lambda p: str(p))
+
+        logger.info("Found %d images for class '%s'", len(file_paths), class_name)
+        for p in file_paths:
+            try:
+                rgb_img = load_rgb_image(p)
+                c_hash = compute_canonical_hash(rgb_img)
+            except Exception as e:
+                logger.error("Error computing hash for %s: %s", p, e)
+                c_hash = f"error_{p.stem}"
+
+            records.append({
+                "original_path": str(p),
+                "class_folder": class_name,
+                "label_index": class_idx,
+                "filename": p.name,
+                "canonical_hash": c_hash,
+            })
+
+    if not records:
+        return pd.DataFrame(columns=["original_path", "class_folder", "label_index", "filename", "canonical_hash", "group_id"])
+
+    df = pd.DataFrame(records)
+    # Assign unique integer group ID per unique canonical hash
+    unique_hashes = {h: idx for idx, h in enumerate(df["canonical_hash"].unique())}
+    df["group_id"] = df["canonical_hash"].map(unique_hashes)
+    return df
 
 
 def compute_class_weights(
     train_df: pd.DataFrame,
-    num_classes: int = 4,
+    num_classes: int = 5,
 ) -> Dict[int, float]:
-    """Compute balanced class weights for imbalanced training distributions.
-
-    Uses the standard inverse-frequency formula:
-    w_j = N / (n_classes * N_j)
-
-    Parameters
-    ----------
-    train_df:
-        DataFrame containing ``label_index`` column for the training split.
-    num_classes:
-        Total number of classes.
-
-    Returns
-    -------
-    Dict[int, float]
-        Dictionary mapping ``class_index -> class_weight``.
-    """
+    """Compute balanced class weights for imbalanced training distributions."""
     labels = train_df["label_index"].values
     unique_classes = np.arange(num_classes)
     weights = compute_class_weight(
@@ -55,30 +136,32 @@ def compute_class_weights(
     return weight_dict
 
 
+def print_duplicate_summary(df: pd.DataFrame) -> None:
+    """Print summary of duplicate groups and total images in duplicate groups."""
+    if len(df) == 0:
+        return
+    group_counts = df["canonical_hash"].value_counts()
+    dup_groups = group_counts[group_counts > 1]
+    num_dup_groups = len(dup_groups)
+    total_dup_images = int(dup_groups.sum()) if num_dup_groups > 0 else 0
+
+    print("\n" + "=" * 70)
+    print("NEAR-DUPLICATE PERCEPTUAL HASH SUMMARY")
+    print("=" * 70)
+    print(f"Total images analyzed   : {len(df)}")
+    print(f"Unique canonical groups : {len(group_counts)}")
+    print(f"Duplicate groups (>1 img): {num_dup_groups}")
+    print(f"Images in duplicate grps: {total_dup_images}")
+    print("=" * 70)
+
+
 def print_class_distribution(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     test_df: pd.DataFrame,
     classes: List[str],
 ) -> pd.DataFrame:
-    """Print a formatted summary table of class counts and percentages across splits.
-
-    Parameters
-    ----------
-    train_df:
-        Training split DataFrame.
-    val_df:
-        Validation split DataFrame.
-    test_df:
-        Test split DataFrame.
-    classes:
-        List of class folder names in canonical order.
-
-    Returns
-    -------
-    pd.DataFrame
-        Distribution summary DataFrame.
-    """
+    """Print a formatted summary table of class counts and percentages across splits."""
     total_samples = len(train_df) + len(val_df) + len(test_df)
     rows = []
 
@@ -115,9 +198,12 @@ def print_class_distribution(
         )
 
     print("-" * 70)
+    train_pct = 100.0 if len(train_df) > 0 else 0.0
+    val_pct = 100.0 if len(val_df) > 0 else 0.0
+    test_pct = 100.0 if len(test_df) > 0 else 0.0
     print(
-        f"{'TOTAL':<15} | {len(train_df):5d} (100.0%) | "
-        f"{len(val_df):5d} (100.0%) | {len(test_df):5d} (100.0%) | {total_samples:6d}"
+        f"{'TOTAL':<15} | {len(train_df):5d} ({train_pct:5.1f}%) | "
+        f"{len(val_df):5d} ({val_pct:5.1f}%) | {len(test_df):5d} ({test_pct:5.1f}%) | {total_samples:6d}"
     )
     print("=" * 70 + "\n")
 
@@ -136,19 +222,8 @@ def make_splits(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Create or load reproducible stratified train / val / test splits.
 
-    Ensures ONE fixed split across runs by persisting splits to CSVs.
-
-    Parameters
-    ----------
-    cfg:
-        Loaded application configuration.
-    force:
-        If ``True``, regenerates splits from scratch even if CSVs exist.
-
-    Returns
-    -------
-    Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
-        ``(train_df, val_df, test_df)``
+    Uses canonical perceptual hash groups and StratifiedGroupKFold (7 folds, ~70/15/15)
+    to guarantee identical/duplicate images never leak across splits.
     """
     splits_dir = cfg.data.splits_dir
     train_csv = splits_dir / "train.csv"
@@ -163,12 +238,12 @@ def make_splits(
         print_class_distribution(train_df, val_df, test_df, cfg.data.classes)
         return train_df, val_df, test_df
 
-    logger.info("Generating new stratified splits (seed=%d)...", cfg.seed)
-    pairs = build_pairs(cfg)
+    logger.info("Discovering images and computing perceptual hashes (seed=%d)...", cfg.seed)
+    df = discover_dataset_images(cfg)
 
-    if len(pairs) == 0:
-        logger.warning("No image pairs found. Empty split DataFrames returned.")
-        empty_cols = ["original_path", "segmented_path", "class_folder", "label_index", "filename"]
+    empty_cols = ["original_path", "class_folder", "label_index", "filename", "canonical_hash", "group_id"]
+    if len(df) == 0:
+        logger.warning("No images found in raw_dir: %s. Empty splits created.", cfg.data.raw_dir)
         train_df = pd.DataFrame(columns=empty_cols)
         val_df = pd.DataFrame(columns=empty_cols)
         test_df = pd.DataFrame(columns=empty_cols)
@@ -177,27 +252,43 @@ def make_splits(
         _write_csv(test_df, test_csv)
         return train_df, val_df, test_df
 
-    val_frac = cfg.data.val_fraction
-    test_frac = cfg.data.test_fraction
+    print_duplicate_summary(df)
 
-    # 1. Carve off stratified test split
-    train_val, test_df = train_test_split(
-        pairs,
-        test_size=test_frac,
-        stratify=pairs["label_index"],
-        random_state=cfg.seed,
+    # Use StratifiedGroupKFold
+    # Check minimum number of groups across classes
+    min_groups_per_class = min(
+        df.groupby("label_index")["group_id"].nunique()
     )
+    n_splits = min(7, max(3, min_groups_per_class))
 
-    # 2. Split train_val into train and validation splits
-    adjusted_val = val_frac / (1.0 - test_frac)
-    train_df, val_df = train_test_split(
-        train_val,
-        test_size=adjusted_val,
-        stratify=train_val["label_index"],
-        random_state=cfg.seed,
-    )
+    if min_groups_per_class >= 3:
+        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=cfg.seed)
+        splits = list(sgkf.split(df, df["label_index"], df["group_id"]))
+        # Fold 0 -> test, Fold 1 -> val, Folds 2..n -> train
+        test_idx = splits[0][1]
+        val_idx = splits[1][1]
+        train_idx = [i for i in range(len(df)) if i not in set(test_idx) and i not in set(val_idx)]
 
-    # Save CSVs to disk for absolute reproducibility across runs
+        train_df = df.iloc[train_idx].reset_index(drop=True)
+        val_df = df.iloc[val_idx].reset_index(drop=True)
+        test_df = df.iloc[test_idx].reset_index(drop=True)
+    else:
+        # Fallback if too few groups per class to fold
+        logger.warning("Fewer than 3 groups in at least one class. Falling back to simple stratified split.")
+        train_val, test_df = train_test_split(
+            df,
+            test_size=cfg.data.test_fraction,
+            stratify=df["label_index"],
+            random_state=cfg.seed,
+        )
+        adj_val = cfg.data.val_fraction / (1.0 - cfg.data.test_fraction)
+        train_df, val_df = train_test_split(
+            train_val,
+            test_size=adj_val,
+            stratify=train_val["label_index"],
+            random_state=cfg.seed,
+        )
+
     _write_csv(train_df, train_csv)
     _write_csv(val_df, val_csv)
     _write_csv(test_df, test_csv)
