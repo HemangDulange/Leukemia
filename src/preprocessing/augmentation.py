@@ -1,19 +1,17 @@
 """
-Training-time augmentation using Keras layers (flip, rotation, zoom, contrast).
-
-Reference implementation from notebooks:
-    data_augmentation = tf.keras.Sequential([
-        layers.RandomFlip("horizontal"),
-        layers.RandomRotation(0.10),
-        layers.RandomZoom(0.10),
-        layers.RandomContrast(0.10)
-    ])
+Training-time augmentation using Keras layers and colour robustness operations.
 
 For the dual-stream architecture:
 - Geometric transforms (Flip, Rotation, Zoom) are applied jointly across both
   Stream A (segmented) and Stream B (original) to ensure exact spatial alignment.
-- Contrast adjustment is applied to Stream B (original image) to avoid
-  distorting the masked boundary of Stream A.
+- Contrast adjustment is applied to Stream B (original image).
+- Colour robustness (Color Jitter & Random Grayscale):
+  - Applied to BOTH streams (train only, after segmentation).
+  - Hue shift +-0.05
+  - Saturation x0.6-1.4
+  - Per-channel gain 0.85-1.15 (multiplicative only, so the black background of the segmented stream stays black)
+  - Random grayscale (p=0.3, converted to grayscale and repeated to 3 channels)
+  - Both switchable off via config.
 - Augmentations are active during training only.
 """
 from __future__ import annotations
@@ -34,21 +32,7 @@ _CONTRAST_LAYER: layers.RandomContrast | None = None
 
 
 def build_augmentation_layers(cfg: AppConfig | None = None) -> tf.keras.Sequential:
-    """Build standard Keras sequential augmentation pipeline for single images.
-
-    Matches reference notebook architecture:
-    [RandomFlip, RandomRotation, RandomZoom, RandomContrast]
-
-    Parameters
-    ----------
-    cfg:
-        Application configuration.
-
-    Returns
-    -------
-    tf.keras.Sequential
-        Keras sequential model containing augmentation layers.
-    """
+    """Build standard Keras sequential augmentation pipeline for single images."""
     if cfg is None:
         cfg = load_config()
 
@@ -90,6 +74,62 @@ def _get_pair_augmenters(cfg: AppConfig) -> Tuple[tf.keras.Sequential, layers.Ra
     return _GEOMETRIC_AUGMENTER, _CONTRAST_LAYER
 
 
+def apply_color_jitter_and_gray(
+    stream_orig: tf.Tensor,
+    stream_seg: tf.Tensor,
+    cfg: AppConfig,
+) -> Tuple[tf.Tensor, tf.Tensor]:
+    """Apply multiplicative color jitter and random grayscale to both streams."""
+    aug_cfg = cfg.augmentation
+    jitter_cfg = aug_cfg.color_jitter if isinstance(aug_cfg.color_jitter, dict) else {}
+    jitter_enabled = jitter_cfg.get("enabled", True) if isinstance(jitter_cfg, dict) else bool(jitter_cfg)
+
+    # 1. Multiplicative Color Jitter (preserves black 0 background on segmented stream)
+    if jitter_enabled:
+        hue_range = float(jitter_cfg.get("hue_range", 0.05))
+        sat_range = jitter_cfg.get("saturation_range", [0.6, 1.4])
+        gain_range = jitter_cfg.get("channel_gain_range", [0.85, 1.15])
+
+        # Random hue shift in [-hue_range, hue_range]
+        if hue_range > 0:
+            hue_delta = tf.random.uniform([], -hue_range, hue_range)
+            stream_orig = tf.image.adjust_hue(stream_orig / 255.0, hue_delta) * 255.0
+            stream_seg = tf.image.adjust_hue(stream_seg / 255.0, hue_delta) * 255.0
+
+        # Random saturation factor in [sat_min, sat_max]
+        if sat_range and len(sat_range) == 2 and sat_range[1] > sat_range[0]:
+            sat_factor = tf.random.uniform([], float(sat_range[0]), float(sat_range[1]))
+            stream_orig = tf.image.adjust_saturation(stream_orig / 255.0, sat_factor) * 255.0
+            stream_seg = tf.image.adjust_saturation(stream_seg / 255.0, sat_factor) * 255.0
+
+        # Multiplicative per-channel gain in [gain_min, gain_max]
+        if gain_range and len(gain_range) == 2:
+            channel_gain = tf.random.uniform([1, 1, 3], float(gain_range[0]), float(gain_range[1]))
+            stream_orig = stream_orig * channel_gain
+            stream_seg = stream_seg * channel_gain
+
+    # 2. Random Grayscale (repeated to 3 channels)
+    gray_prob = float(getattr(aug_cfg, "random_gray_prob", 0.3))
+    if gray_prob > 0.0:
+        do_gray = tf.random.uniform([]) < gray_prob
+
+        def _to_gray(im: tf.Tensor) -> tf.Tensor:
+            g = tf.image.rgb_to_grayscale(im)
+            return tf.repeat(g, 3, axis=-1)
+
+        stream_orig, stream_seg = tf.cond(
+            do_gray,
+            lambda: (_to_gray(stream_orig), _to_gray(stream_seg)),
+            lambda: (stream_orig, stream_seg),
+        )
+
+    # Maintain strictly in [0.0, 255.0]
+    stream_orig = tf.clip_by_value(stream_orig, 0.0, 255.0)
+    stream_seg = tf.clip_by_value(stream_seg, 0.0, 255.0)
+
+    return stream_orig, stream_seg
+
+
 def augment_pair(
     imgs: Tuple[tf.Tensor, tf.Tensor],
     label: tf.Tensor,
@@ -101,6 +141,7 @@ def augment_pair(
     Jointly transforms Stream original and Stream segmented along channels
     so that geometric distortions (flip, rotation, zoom) match exactly.
     Then applies contrast augmentation to the original stream only.
+    Then applies multiplicative color jitter and random grayscale to both streams.
     Both streams are maintained strictly in [0.0, 255.0].
 
     Parameters
@@ -125,10 +166,8 @@ def augment_pair(
     stream_orig, stream_seg = imgs
     geom_model, contrast_layer = _get_pair_augmenters(cfg)
 
-    # Concatenate along channel dimension: (H, W, 6)
-    # This allows joint geometric transformations with identical random parameters
+    # 1. Joint geometric transformations (Flip, Rotation, Zoom)
     concat_img = tf.concat([stream_orig, stream_seg], axis=-1)
-    # Add batch dimension for Keras layer: (1, H, W, 6)
     batched = tf.expand_dims(concat_img, axis=0)
 
     aug_batched = geom_model(batched, training=True)
@@ -138,13 +177,12 @@ def augment_pair(
     aug_orig = aug_concat[..., 0:3]
     aug_seg = aug_concat[..., 3:6]
 
-    # Contrast layer on original stream only
+    # 2. Contrast layer on original stream only
     aug_orig_batched = tf.expand_dims(aug_orig, axis=0)
     aug_orig_contrast = contrast_layer(aug_orig_batched, training=True)
     aug_orig = tf.squeeze(aug_orig_contrast, axis=0)
 
-    # Clip both streams to valid [0.0, 255.0] range
-    aug_orig = tf.clip_by_value(aug_orig, 0.0, 255.0)
-    aug_seg = tf.clip_by_value(aug_seg, 0.0, 255.0)
+    # 3. Colour robustness (Color jitter & random grayscale on both streams)
+    aug_orig, aug_seg = apply_color_jitter_and_gray(aug_orig, aug_seg, cfg)
 
     return (aug_orig, aug_seg), label

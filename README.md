@@ -78,16 +78,44 @@ Canonical class mapping is configured via `configs/config.yaml` and persisted to
 
 ---
 
-## 🔍 Near-Duplicate-Aware Perceptual Hash Splits
+## 🔍 Near-Duplicate-Aware Pearson Correlation Splits
 
 To guarantee absolute split independence and prevent data leakage:
-1. **Canonical Perceptual Hashing**:
-   - Each image is downsampled: $64 \times 64$ RGB $\rightarrow 8 \times 8$ grayscale $\rightarrow$ mean-thresholded 64-bit boolean string.
-   - Evaluated across all 8 D4 dihedral symmetries (4 rotations $\times$ horizontal flip), taking the lexicographical minimum bit string.
-   - Rotated, mirrored, or identical image variants receive the exact same canonical hash and `group_id`.
+1. **Pearson Correlation Near-Duplicate Detection**:
+   - Generates $64 \times 64$ RGB thumbnails with PIL draft mode for JPEGs using an 8-worker `ThreadPoolExecutor`.
+   - Thumbnails are cached to `data/processed/thumbs64.npy` for instant reloading.
+   - Converted to $32 \times 32$ grayscale (block averaging), zero-mean centered, and L2-normalized.
+   - Evaluated across all 8 D4 dihedral symmetries (4 rotations $\times$ horizontal flip) using chunked matrix multiplication ($500 \times 500$ blocks).
+   - Images with maximum Pearson correlation $\ge \text{dedup\_threshold}$ (default `0.995`) form near-duplicate pairs and are grouped via `scipy.sparse.csgraph.connected_components`.
+   - **Cluster Safety Threshold**: Any group with $> 25$ images is dissolved into singletons with a logged warning, preventing false-positive clustering on plain dark/blank background images.
 2. **Stratified Group Splitting (`StratifiedGroupKFold`)**:
    - 7 folds are evaluated with fixed seed 42 (Fold 0 = Test ~15%, Fold 1 = Validation ~15%, Folds 2–6 = Train ~70%).
    - All near-duplicates belonging to the same group land strictly in the same split.
+3. **Exclusion List (`data.exclude_files`)**:
+   - Optional config key `data.exclude_files` (list of relative paths) skipped during dataset image discovery.
+
+---
+
+## 🎨 Color Robustness & Disentanglement
+
+Because peripheral blood smear stain colors can vary drastically between laboratories and slide preparation protocols (or correlate artificially with diagnostic subtypes):
+1. **Multiplicative Color Jitter (Train-Only)**:
+   - Applied to both streams after segmentation:
+     - Hue shift: $\pm 0.05$
+     - Saturation factor: $\times 0.6 - 1.4$
+     - Per-channel gain: $0.85 - 1.15$
+   - Strictly multiplicative transformations preserve zero-valued black pixels $(0, 0, 0)$ on the segmented stream without additive bleed.
+2. **Random Grayscale Augmentation**:
+   - Converts both streams to grayscale with probability $p = 0.30$ and repeats the luminance channel across 3 channels, forcing the network to learn cell morphology and texture rather than relying on stain hue.
+3. **Color-Only Baseline Classifier (`scripts/colour_baseline.py`)**:
+   - Random Forest (200 trees, seed 42) trained on the TRAIN split and tested on the TEST split using **only 4 color/illumination features**:
+     1. Mean Red ($R$) intensity
+     2. Mean Green ($G$) intensity
+     3. Mean Blue ($B$) intensity
+     4. Black-pixel share ($\max(R, G, B) < 25$)
+   - Exports feature importances and confusion matrix to `reports/metrics/colour_baseline.csv` to benchmark against deep morphological representations.
+4. **Grayscale Robustness Evaluation (`scripts/evaluate.py --gray-test`)**:
+   - Runs model evaluation on the test split with both streams forced to grayscale, printing a side-by-side comparison table of overall accuracy and per-class recall against normal RGB images.
 
 ---
 
@@ -209,8 +237,9 @@ leukemia-all-classifier/
 │   ├── prepare_data.py         # Discover images and generate reproducible splits
 │   ├── precompute_segmented.py # Precompute unified PNG pairs
 │   ├── preview_masks.py        # 30-image mask preview grid across all 5 classes
+│   ├── colour_baseline.py      # Random Forest color-only baseline (mean RGB + black share)
 │   ├── train.py                # Train model (calls precompute automatically)
-│   ├── evaluate.py             # Evaluate test split performance & metrics
+│   ├── evaluate.py             # Evaluate test split performance (--gray-test, --ablation)
 │   ├── check_serving_skew.py   # Verify live Predictor vs offline pipeline parity
 │   └── make_samples.py         # Pick median-confidence samples per class & bundle zip
 ├── app/

@@ -10,12 +10,14 @@ Functions:
    - Multi-class ROC curves per class
    - Accuracy and loss curves (if history.json is found)
 5. Optional ablation study (--ablation):
-   Compares dual-stream against segmented-only and original-only streams to prove
-   the multi-stream synergistic benefit.
+   Compares dual-stream against segmented-only and original-only streams.
+6. Optional grayscale evaluation (--gray-test):
+   Evaluates the model with both streams converted to grayscale (repeated to 3 channels)
+   and prints accuracy and per-class recall next to normal RGB results.
 
 Usage
 -----
-    python scripts/evaluate.py [--config PATH] [--smoke-test] [--ablation]
+    python scripts/evaluate.py [--config PATH] [--smoke-test] [--ablation] [--gray-test]
 """
 from __future__ import annotations
 
@@ -44,6 +46,7 @@ from src.evaluation.plots import (
     plot_training_history,
 )
 from src.inference.model_loader import load_trained_model
+from src.models.dual_stream import build_dual_stream_model
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,8 +60,9 @@ def predict_dataset(
     model: tf.keras.Model,
     dataset: tf.data.Dataset,
     ablation_mode: str = "dual_stream",
+    force_grayscale: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Collect predictions across dataset under a given ablation configuration.
+    """Collect predictions across dataset under a given ablation or grayscale configuration.
 
     Parameters
     ----------
@@ -68,6 +72,8 @@ def predict_dataset(
         tf.data test dataset yielding ({"original": ..., "segmented": ...}, label).
     ablation_mode:
         One of {'dual_stream', 'original_only', 'segmented_only'}.
+    force_grayscale:
+        If True, converts both original and segmented inputs to grayscale (repeated across 3 channels).
 
     Returns
     -------
@@ -81,11 +87,13 @@ def predict_dataset(
         orig = batch_inputs["original"]
         seg = batch_inputs["segmented"]
 
+        if force_grayscale:
+            orig = tf.repeat(tf.image.rgb_to_grayscale(orig), 3, axis=-1)
+            seg = tf.repeat(tf.image.rgb_to_grayscale(seg), 3, axis=-1)
+
         if ablation_mode == "original_only":
-            # Mask out segmented stream with zeros
             inputs = {"original": orig, "segmented": tf.zeros_like(seg)}
         elif ablation_mode == "segmented_only":
-            # Mask out original stream with zeros
             inputs = {"original": tf.zeros_like(orig), "segmented": seg}
         else:
             inputs = {"original": orig, "segmented": seg}
@@ -168,6 +176,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run ablation study comparing segmented-only, original-only, and dual-stream",
     )
+    parser.add_argument(
+        "--gray-test",
+        action="store_true",
+        help="Evaluate test split with both streams converted to grayscale (repeated to 3 channels)",
+    )
     return parser.parse_args()
 
 
@@ -183,17 +196,27 @@ def main() -> None:
     else:
         display_names = cfg.data.classes
 
-    # 2. Load trained model
+    # 2. Load trained model or instantiate smoke-test model
     model_path = cfg.paths.model_path
-    if not model_path.exists():
+    img_size = cfg.image.smoke_test_size if args.smoke_test else cfg.image.size
+
+    if model_path.exists():
+        logger.info("Loading model from %s...", model_path)
+        model = load_trained_model(cfg, custom_path=model_path)
+        if hasattr(model, "input_shape") and isinstance(model.input_shape, list) and model.input_shape[0]:
+            img_size = model.input_shape[0][1] or img_size
+    elif args.smoke_test:
+        logger.warning(
+            "Model file not found at %s. Smoke-test mode: building untrained dual-stream model.",
+            model_path,
+        )
+        model = build_dual_stream_model(cfg, img_size=img_size, weights=None)
+    else:
         logger.error(
             "Trained model not found at '%s'. Train the model first with `python scripts/train.py`.",
             model_path,
         )
         sys.exit(1)
-
-    logger.info("Loading model from %s...", model_path)
-    model = load_trained_model(cfg, custom_path=model_path)
 
     # 3. Load fixed test dataset
     _, _, test_df = make_splits(cfg)
@@ -205,8 +228,10 @@ def main() -> None:
         else:
             logger.error("Test split in %s has 0 rows. Prepare data first.", cfg.data.splits_dir)
             sys.exit(1)
+    elif args.smoke_test:
+        test_df = test_df.head(min(16, len(test_df)))
 
-    test_ds = build_dataset(test_df, cfg, split="test", smoke_test=args.smoke_test, img_size=cfg.image.size)
+    test_ds = build_dataset(test_df, cfg, split="test", smoke_test=args.smoke_test, img_size=img_size)
 
     # 4. Predict on full dual-stream model
     logger.info("Generating predictions on test set (%d samples)...", len(test_df))
@@ -265,7 +290,37 @@ def main() -> None:
     print(report_df.to_string())
     print("=" * 60 + "\n")
 
-    # 8. Optional Ablation Study
+    # 8. Grayscale Robustness Evaluation (--gray-test)
+    if args.gray_test:
+        logger.info("Executing grayscale evaluation on test split (both streams in grayscale)...")
+        y_true_gray, y_pred_proba_gray = predict_dataset(
+            model,
+            test_ds,
+            ablation_mode="dual_stream",
+            force_grayscale=True,
+        )
+        gray_metrics = compute_evaluation_metrics(y_true_gray, y_pred_proba_gray, display_names)
+
+        # Print side-by-side comparison table
+        print("\n" + "=" * 70)
+        print("GRAYSCALE ROBUSTNESS EVALUATION COMPARISON (--gray-test)")
+        print("=" * 70)
+        print(f"{'Metric / Subtype':<25} | {'Normal (RGB)':^18} | {'Grayscale Test':^18}")
+        print("-" * 70)
+        print(
+            f"{'Overall Accuracy':<25} | {metrics['accuracy'] * 100:16.2f}% | "
+            f"{gray_metrics['accuracy'] * 100:16.2f}%"
+        )
+        print("-" * 70)
+        normal_report = metrics["classification_report"]
+        gray_report = gray_metrics["classification_report"]
+        for name in display_names:
+            norm_rec = normal_report.get(name, {}).get("recall", 0.0) * 100
+            gray_rec = gray_report.get(name, {}).get("recall", 0.0) * 100
+            print(f"{name + ' Recall':<25} | {norm_rec:16.2f}% | {gray_rec:16.2f}%")
+        print("=" * 70 + "\n")
+
+    # 9. Optional Ablation Study
     if args.ablation:
         run_ablation_study(model, test_ds, display_names, cfg)
 

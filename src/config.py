@@ -9,7 +9,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import yaml
@@ -30,6 +30,8 @@ class DataConfig:
     test_fraction: float
     display_names: Dict[str, str] = field(default_factory=dict)
     processed_dir: Path = field(default_factory=lambda: _REPO_ROOT / "data" / "processed")
+    dedup_threshold: float = 0.995
+    exclude_files: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -84,6 +86,8 @@ class AugmentationConfig:
     width_shift_range: float = 0.1
     height_shift_range: float = 0.1
     brightness_range: Tuple[float, float] = (0.85, 1.15)
+    color_jitter: Dict[str, Any] = field(default_factory=dict)
+    random_gray_prob: float = 0.3
 
 
 @dataclass
@@ -186,6 +190,8 @@ def load_config(config_path: Path | str | None = None) -> AppConfig:
         val_fraction=data_raw["val_fraction"],
         test_fraction=data_raw["test_fraction"],
         processed_dir=_resolve_path(processed_val, root),
+        dedup_threshold=float(data_raw.get("dedup_threshold", 0.995)),
+        exclude_files=list(data_raw.get("exclude_files", [])),
     )
 
     img_raw = raw["image"]
@@ -224,6 +230,8 @@ def load_config(config_path: Path | str | None = None) -> AppConfig:
         width_shift_range=aug_raw.get("width_shift_range", 0.1),
         height_shift_range=aug_raw.get("height_shift_range", 0.1),
         brightness_range=tuple(aug_raw.get("brightness_range", [0.85, 1.15])),
+        color_jitter=aug_raw.get("color_jitter", {}),
+        random_gray_prob=float(aug_raw.get("random_gray_prob", 0.3)),
     )
 
     mdl_raw = raw["model"]

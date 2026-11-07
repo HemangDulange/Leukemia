@@ -1,13 +1,18 @@
 """
-Stratified train / validation / test splits with near-duplicate perceptual hashing.
+Stratified train / validation / test splits with Pearson correlation near-duplicate grouping.
 
-Discovers images per class folder (.jpg, .jpeg, .png, .bmp, .tif, .tiff), computes
-canonical rotation/flip-invariant perceptual hashes to group identical or near-duplicate
-images, and creates a reproducible 70/15/15 split using StratifiedGroupKFold (fixed seed 42).
-Subsequent runs reload the saved CSVs to guarantee zero data leakage.
+Discovers images per class folder (.jpg, .jpeg, .png, .bmp, .tif, .tiff), skipping any
+paths in cfg.data.exclude_files. Generates 64x64 RGB thumbnails (with PIL draft mode for JPEG
+and ThreadPoolExecutor with 8 workers), converts to 32x32 grayscale, subtracts the mean,
+and L2-normalizes. Two images are considered near-duplicates if their maximum Pearson correlation
+over the 8 dihedral rotations/flips is >= dedup_threshold (config key, default 0.995), computed
+in chunks of 500 rows with matrix multiplication and grouped via scipy.sparse.csgraph.connected_components.
+Safety: groups with > 25 images are kept as singletons.
+Creates a reproducible split with StratifiedGroupKFold (fixed seed 42).
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
@@ -15,6 +20,8 @@ from typing import Dict, List, Set, Tuple
 import numpy as np
 import pandas as pd
 from PIL import Image
+import scipy.sparse as sp
+from scipy.sparse.csgraph import connected_components
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -26,11 +33,7 @@ VALID_EXTENSIONS: Set[str] = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
 def load_rgb_image(img_path: Path | str) -> Image.Image:
-    """Safely open any supported image format and convert it to 8-bit RGB.
-
-    Handles 16-bit TIFFs (mode 'I;16', 'I', 'F'), palette images ('P'),
-    RGBA/LA with alpha, and grayscale ('L').
-    """
+    """Safely open any supported image format and convert it to 8-bit RGB."""
     Image.MAX_IMAGE_PIXELS = None
     with Image.open(img_path) as img:
         if img.mode in ("I;16", "I;16B", "I;16L", "I", "F"):
@@ -48,35 +51,172 @@ def load_rgb_image(img_path: Path | str) -> Image.Image:
         return img.convert("RGB")
 
 
-def compute_canonical_hash(img: Image.Image) -> str:
-    """Compute canonical 64-bit perceptual hash invariant across 8 D4 rotations/flips.
+def load_thumbnail_64(path: Path | str) -> np.ndarray:
+    """Make a 64x64 RGB thumbnail using PIL draft mode for fast JPEG decoding."""
+    p = Path(path)
+    Image.MAX_IMAGE_PIXELS = None
+    with Image.open(p) as img:
+        if p.suffix.lower() in (".jpg", ".jpeg"):
+            try:
+                img.draft("RGB", (64, 64))
+            except Exception:
+                pass
+        if img.mode in ("I;16", "I;16B", "I;16L", "I", "F"):
+            arr = np.array(img, dtype=np.float32)
+            max_val = float(arr.max()) if arr.size > 0 else 1.0
+            if max_val > 255.0:
+                arr = (arr / max(max_val, 65535.0)) * 255.0
+            arr = np.clip(arr, 0.0, 255.0).astype(np.uint8)
+            rgb = Image.fromarray(arr).convert("RGB")
+        elif img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            rgba = img.convert("RGBA")
+            bg = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+            rgb = Image.alpha_composite(bg, rgba).convert("RGB")
+        else:
+            rgb = img.convert("RGB")
+        thumb = rgb.resize((64, 64), Image.Resampling.BILINEAR)
+        return np.array(thumb, dtype=np.uint8)
 
-    Steps:
-    1. 64x64 RGB thumbnail
-    2. 8x8 grayscale
-    3. Bit string (pixel > mean)
-    4. Lexicographical minimum over all 8 rotations and flips
+
+def load_or_compute_thumbnails(file_paths: List[Path], cache_path: Path) -> np.ndarray:
+    """Load cached 64x64 thumbnails or compute in parallel with 8 worker threads."""
+    if cache_path.exists():
+        try:
+            cached = np.load(cache_path)
+            if len(cached) == len(file_paths):
+                logger.info("Loaded %d cached thumbnails from %s", len(cached), cache_path)
+                return cached
+            logger.warning(
+                "Cached thumbnails count (%d) mismatches file list (%d). Recomputing...",
+                len(cached),
+                len(file_paths),
+            )
+        except Exception as e:
+            logger.warning("Failed to load cached thumbnails (%s). Recomputing...", e)
+
+    logger.info("Reading %d image thumbnails (ThreadPoolExecutor with 8 workers)...", len(file_paths))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        thumbs_list = list(executor.map(load_thumbnail_64, file_paths))
+
+    thumbs64 = np.stack(thumbs_list, axis=0)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, thumbs64)
+    logger.info("Cached %d thumbnails to %s", len(thumbs64), cache_path)
+    return thumbs64
+
+
+def compute_near_duplicate_groups(
+    thumbs64: np.ndarray,
+    dedup_threshold: float = 0.995,
+    chunk_size: int = 500,
+) -> Tuple[np.ndarray, int, int, int, int]:
+    """Find near-duplicate groups using Pearson correlation across 8 dihedral transforms.
+
+    Returns:
+        (group_ids, num_groups, images_inside_groups, largest_group, num_dup_groups)
     """
-    thumb = img.resize((64, 64), Image.Resampling.BILINEAR)
-    gray = thumb.convert("L").resize((8, 8), Image.Resampling.BILINEAR)
-    arr = np.array(gray, dtype=np.float32)
-    mean_val = float(arr.mean())
+    N = len(thumbs64)
+    if N == 0:
+        return np.array([], dtype=np.int32), 0, 0, 0, 0
 
-    bit_arrays: List[str] = []
-    base_variants = [arr, np.fliplr(arr)]
+    # 1. Grayscale & average 2x2 blocks to 32x32
+    gray64 = (
+        0.2989 * thumbs64[..., 0].astype(np.float32)
+        + 0.5870 * thumbs64[..., 1].astype(np.float32)
+        + 0.1140 * thumbs64[..., 2].astype(np.float32)
+    )  # (N, 64, 64)
+    gray32 = gray64.reshape(N, 32, 2, 32, 2).mean(axis=(2, 4))  # (N, 32, 32)
+
+    # 2. Subtract mean and L2-normalize for each of the 8 D4 dihedral transforms
+    transforms = []
+    base_variants = [gray32, np.flip(gray32, axis=2)]
     for base in base_variants:
         for k in range(4):
-            rotated = np.rot90(base, k)
-            bits = (rotated > mean_val).astype(int).flatten()
-            bit_str = "".join(map(str, bits))
-            bit_arrays.append(bit_str)
-    return min(bit_arrays)
+            rot = np.rot90(base, k, axes=(1, 2))
+            v = rot.reshape(N, -1)
+            v = v - v.mean(axis=1, keepdims=True)
+            n = np.linalg.norm(v, axis=1, keepdims=True)
+            v = np.where(n > 1e-8, v / np.maximum(n, 1e-8), 0.0)
+            transforms.append(v)
+
+    # 3. Compute Pearson correlation in chunks of 500 rows with matrix multiplication
+    logger.info(
+        "Computing pair-wise Pearson correlations across 8 dihedral transforms in chunks of %d (threshold=%.4f)...",
+        chunk_size,
+        dedup_threshold,
+    )
+    pairs = []
+    V_ref = transforms[0]
+    for i in range(0, N, chunk_size):
+        i_end = min(i + chunk_size, N)
+        A = V_ref[i:i_end]  # (M_i, 1024)
+        for j in range(i, N, chunk_size):
+            j_end = min(j + chunk_size, N)
+            max_corr = np.zeros((i_end - i, j_end - j), dtype=np.float32)
+            for k in range(8):
+                B_k = transforms[k][j:j_end]  # (M_j, 1024)
+                corr_k = np.dot(A, B_k.T)     # (M_i, M_j)
+                np.maximum(max_corr, corr_k, out=max_corr)
+            if i == j:
+                mask = np.triu(max_corr >= dedup_threshold, k=1)
+            else:
+                mask = max_corr >= dedup_threshold
+            rows, cols = np.where(mask)
+            for r, c in zip(rows, cols):
+                pairs.append((i + r, j + c))
+
+    logger.info("Found %d near-duplicate pair connections.", len(pairs))
+
+    # 4. Build groups with scipy.sparse.csgraph.connected_components
+    if pairs:
+        r, c = zip(*pairs)
+        data = np.ones(len(r) * 2, dtype=bool)
+        rows = np.concatenate([r, c])
+        cols = np.concatenate([c, r])
+        adj = sp.csr_matrix((data, (rows, cols)), shape=(N, N))
+    else:
+        adj = sp.csr_matrix((N, N), dtype=bool)
+
+    n_components, labels = connected_components(adj, directed=False)
+
+    # 5. Safety: if a group has > 25 images, treat members as singletons and log warning
+    final_group_ids = np.zeros(N, dtype=np.int32)
+    next_group_id = 0
+    component_members: Dict[int, List[int]] = {}
+    for idx, comp in enumerate(labels):
+        component_members.setdefault(comp, []).append(idx)
+
+    for comp, members in component_members.items():
+        if len(members) > 25:
+            logger.warning(
+                "Safety threshold triggered: Group %d has %d images (> 25 limit). "
+                "Treating members as independent singletons to prevent large false-positive clustering.",
+                comp,
+                len(members),
+            )
+            for m in members:
+                final_group_ids[m] = next_group_id
+                next_group_id += 1
+        else:
+            for m in members:
+                final_group_ids[m] = next_group_id
+            next_group_id += 1
+
+    group_sizes = pd.Series(final_group_ids).value_counts()
+    dup_groups = group_sizes[group_sizes > 1]
+    num_groups = len(group_sizes)
+    images_inside_groups = int(dup_groups.sum()) if len(dup_groups) > 0 else 0
+    largest_group = int(group_sizes.max()) if len(group_sizes) > 0 else 0
+    num_dup_groups = len(dup_groups)
+
+    return final_group_ids, num_groups, images_inside_groups, largest_group, num_dup_groups
 
 
 def discover_dataset_images(cfg: AppConfig) -> pd.DataFrame:
-    """Scan raw directory for images across all configured classes and compute canonical hashes."""
+    """Scan raw directory for images across classes, applying exclude_files filtering."""
     raw_dir = cfg.data.raw_dir
     classes = cfg.data.classes
+    exclude_set = {Path(f).as_posix() for f in cfg.data.exclude_files}
     records = []
 
     logger.info("Discovering images in %s across %d classes...", raw_dir, len(classes))
@@ -86,36 +226,56 @@ def discover_dataset_images(cfg: AppConfig) -> pd.DataFrame:
             logger.warning("Class directory not found: %s", class_folder)
             continue
 
-        file_paths = [
+        raw_files = [
             p for p in class_folder.rglob("*")
             if p.is_file() and p.suffix.lower() in VALID_EXTENSIONS
         ]
-        file_paths.sort(key=lambda p: str(p))
+        raw_files.sort(key=lambda p: str(p))
+
+        # Filter out excluded files
+        file_paths = []
+        for p in raw_files:
+            rel_raw = p.relative_to(raw_dir).as_posix()
+            rel_cls = p.relative_to(class_folder).as_posix()
+            if rel_raw in exclude_set or rel_cls in exclude_set or p.name in exclude_set:
+                logger.info("Excluding file per config: %s", p)
+                continue
+            file_paths.append(p)
 
         logger.info("Found %d images for class '%s'", len(file_paths), class_name)
         for p in file_paths:
-            try:
-                rgb_img = load_rgb_image(p)
-                c_hash = compute_canonical_hash(rgb_img)
-            except Exception as e:
-                logger.error("Error computing hash for %s: %s", p, e)
-                c_hash = f"error_{p.stem}"
-
             records.append({
                 "original_path": str(p),
                 "class_folder": class_name,
                 "label_index": class_idx,
                 "filename": p.name,
-                "canonical_hash": c_hash,
             })
 
     if not records:
-        return pd.DataFrame(columns=["original_path", "class_folder", "label_index", "filename", "canonical_hash", "group_id"])
+        return pd.DataFrame(columns=["original_path", "class_folder", "label_index", "filename", "group_id"])
 
     df = pd.DataFrame(records)
-    # Assign unique integer group ID per unique canonical hash
-    unique_hashes = {h: idx for idx, h in enumerate(df["canonical_hash"].unique())}
-    df["group_id"] = df["canonical_hash"].map(unique_hashes)
+    file_paths = [Path(p) for p in df["original_path"]]
+    cache_path = cfg.data.processed_dir / "thumbs64.npy"
+
+    thumbs64 = load_or_compute_thumbnails(file_paths, cache_path)
+    group_ids, num_groups, images_inside_groups, largest_group, num_dup_groups = compute_near_duplicate_groups(
+        thumbs64,
+        dedup_threshold=cfg.data.dedup_threshold,
+        chunk_size=500,
+    )
+    df["group_id"] = group_ids
+
+    print("\n" + "=" * 70)
+    print("NEAR-DUPLICATE GROUPING SUMMARY (PEARSON CORRELATION)")
+    print("=" * 70)
+    print(f"Total images analyzed   : {len(df)}")
+    print(f"Total unique groups     : {num_groups}")
+    print(f"Duplicate groups (>1)   : {num_dup_groups}")
+    print(f"Images inside groups    : {images_inside_groups}")
+    print(f"Largest group size      : {largest_group}")
+    print("=" * 70)
+
     return df
 
 
@@ -134,25 +294,6 @@ def compute_class_weights(
     weight_dict = {int(cls): float(w) for cls, w in zip(unique_classes, weights)}
     logger.info("Computed class weights: %s", weight_dict)
     return weight_dict
-
-
-def print_duplicate_summary(df: pd.DataFrame) -> None:
-    """Print summary of duplicate groups and total images in duplicate groups."""
-    if len(df) == 0:
-        return
-    group_counts = df["canonical_hash"].value_counts()
-    dup_groups = group_counts[group_counts > 1]
-    num_dup_groups = len(dup_groups)
-    total_dup_images = int(dup_groups.sum()) if num_dup_groups > 0 else 0
-
-    print("\n" + "=" * 70)
-    print("NEAR-DUPLICATE PERCEPTUAL HASH SUMMARY")
-    print("=" * 70)
-    print(f"Total images analyzed   : {len(df)}")
-    print(f"Unique canonical groups : {len(group_counts)}")
-    print(f"Duplicate groups (>1 img): {num_dup_groups}")
-    print(f"Images in duplicate grps: {total_dup_images}")
-    print("=" * 70)
 
 
 def print_class_distribution(
@@ -222,8 +363,8 @@ def make_splits(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Create or load reproducible stratified train / val / test splits.
 
-    Uses canonical perceptual hash groups and StratifiedGroupKFold (7 folds, ~70/15/15)
-    to guarantee identical/duplicate images never leak across splits.
+    Uses Pearson correlation near-duplicate groups and StratifiedGroupKFold
+    (7 folds, ~70/15/15) to guarantee near-duplicate images never leak across splits.
     """
     splits_dir = cfg.data.splits_dir
     train_csv = splits_dir / "train.csv"
@@ -238,10 +379,10 @@ def make_splits(
         print_class_distribution(train_df, val_df, test_df, cfg.data.classes)
         return train_df, val_df, test_df
 
-    logger.info("Discovering images and computing perceptual hashes (seed=%d)...", cfg.seed)
+    logger.info("Discovering images and computing Pearson correlation near-duplicate groups (seed=%d)...", cfg.seed)
     df = discover_dataset_images(cfg)
 
-    empty_cols = ["original_path", "class_folder", "label_index", "filename", "canonical_hash", "group_id"]
+    empty_cols = ["original_path", "class_folder", "label_index", "filename", "group_id"]
     if len(df) == 0:
         logger.warning("No images found in raw_dir: %s. Empty splits created.", cfg.data.raw_dir)
         train_df = pd.DataFrame(columns=empty_cols)
@@ -252,10 +393,7 @@ def make_splits(
         _write_csv(test_df, test_csv)
         return train_df, val_df, test_df
 
-    print_duplicate_summary(df)
-
     # Use StratifiedGroupKFold
-    # Check minimum number of groups across classes
     min_groups_per_class = min(
         df.groupby("label_index")["group_id"].nunique()
     )
@@ -273,7 +411,6 @@ def make_splits(
         val_df = df.iloc[val_idx].reset_index(drop=True)
         test_df = df.iloc[test_idx].reset_index(drop=True)
     else:
-        # Fallback if too few groups per class to fold
         logger.warning("Fewer than 3 groups in at least one class. Falling back to simple stratified split.")
         train_val, test_df = train_test_split(
             df,

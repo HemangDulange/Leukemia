@@ -21,6 +21,8 @@ data:
     ProB: "Pro-B ALL"
   val_fraction: 0.15
   test_fraction: 0.15
+  dedup_threshold: 0.995
+  exclude_files: []
 
 # ── Image ───────────────────────────────────────────────────────────────────
 image:
@@ -58,6 +60,13 @@ augmentation:
   width_shift_range: 0.1
   height_shift_range: 0.1
   brightness_range: [0.85, 1.15]
+  # Colour robustness (train-only, applied after segmentation)
+  color_jitter:
+    enabled: true
+    hue_range: 0.05
+    saturation_range: [0.6, 1.4]
+    channel_gain_range: [0.85, 1.15]
+  random_gray_prob: 0.3
 
 # ── Model ───────────────────────────────────────────────────────────────────
 model:

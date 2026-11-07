@@ -92,8 +92,16 @@ def draw_synthetic_cell(width: int, height: int, rng: np.random.RandomState) -> 
     return img
 
 
-def create_fake_dataset(output_dir: Path, images_per_class: int = 12) -> None:
-    """Generate fake dataset for testing."""
+def create_fake_dataset(
+    output_dir: Path,
+    images_per_class: int = 12,
+    test_large_cluster: bool = False,
+) -> None:
+    """Generate fake dataset for testing.
+
+    If test_large_cluster is True, creates 28 near-duplicate images in the AML class
+    to test the > 25 member safety threshold in near-duplicate grouping.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.RandomState(42)
 
@@ -104,18 +112,23 @@ def create_fake_dataset(output_dir: Path, images_per_class: int = 12) -> None:
         class_folder = output_dir / class_name
         class_folder.mkdir(parents=True, exist_ok=True)
 
+        n_images = 28 if (test_large_cluster and class_name == "AML") else images_per_class
         base_img: Image.Image | None = None
 
-        for idx in range(images_per_class):
+        for idx in range(n_images):
             width, height = SIZES[idx % len(SIZES)]
             fmt, ext = FORMAT_EXTS[idx % len(FORMAT_EXTS)]
             filename = f"sample_{class_name}_{idx:03d}{ext}"
             file_path = class_folder / filename
 
-            # Make image 0 a base image, and image 1 & 2 rotated/flipped duplicates in this class
+            # Make image 0 a base image, and subsequent images rotated/flipped duplicates
             if idx == 0:
                 img = draw_synthetic_cell(width, height, rng)
                 base_img = img
+            elif test_large_cluster and class_name == "AML" and base_img is not None:
+                # Rotated or slightly transformed duplicates to form a large cluster
+                rot_deg = (idx * 90) % 360
+                img = base_img.rotate(rot_deg, expand=True)
             elif idx == 1 and base_img is not None:
                 # Rotated duplicate
                 img = base_img.rotate(90, expand=True)
@@ -137,7 +150,7 @@ def create_fake_dataset(output_dir: Path, images_per_class: int = 12) -> None:
 
             total_created += 1
 
-        print(f"  Created {images_per_class} images in {class_name}/")
+        print(f"  Created {n_images} images in {class_name}/")
 
     print(f"\n[DONE] Created {total_created} total images across {len(CLASSES)} classes in {output_dir}")
 
@@ -156,8 +169,17 @@ def main() -> None:
         default=12,
         help="Number of images per class (default: 12)",
     )
+    parser.add_argument(
+        "--test-large-cluster",
+        action="store_true",
+        help="Create a class with >25 near-duplicate images to verify cluster safety limit",
+    )
     args = parser.parse_args()
-    create_fake_dataset(args.output_dir, args.images_per_class)
+    create_fake_dataset(
+        args.output_dir,
+        args.images_per_class,
+        test_large_cluster=args.test_large_cluster,
+    )
 
 
 if __name__ == "__main__":
